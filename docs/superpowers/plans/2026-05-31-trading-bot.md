@@ -1222,6 +1222,7 @@ from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 from db.database import Base
 from db.models import Strategy, Trade, PortfolioHistory, DailyPerformance
 from decimal import Decimal
@@ -1229,7 +1230,13 @@ from datetime import datetime, date
 
 @pytest.fixture
 def db_engine():
-    e = create_engine("sqlite:///:memory:")
+    # TestClient는 앱을 별도 스레드에서 구동 → in-memory SQLite는 연결마다 DB가 분리됨.
+    # StaticPool + check_same_thread=False 로 단일 연결을 공유해 동일 DB를 보게 함.
+    e = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     Base.metadata.create_all(e)
     return e
 
