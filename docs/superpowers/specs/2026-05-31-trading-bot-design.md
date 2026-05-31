@@ -19,43 +19,50 @@
 ## 2. 아키텍처
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                  FastAPI 프로세스                     │
-│                                                      │
-│  ┌──────────────────────────────────────────────┐   │
-│  │           Strategy Manager (스레드)           │   │
-│  │  - 프로세스 크래시 감시 (30s 주기)             │   │
-│  │  - portfolio_history 기록 (5min 주기)          │   │
-│  └──────────┬──────────────┬─────────────────────┘  │
-│             │              │                         │
-│  POST /start│    POST /stop│  ← API 요청 시 직접 제어│
-└─────────────┼──────────────┼─────────────────────────┘
-              │              │
-        ┌─────▼──┐     ┌─────▼──┐     ┌────────┐
-        │Strategy│     │Strategy│     │Strategy│  ...
-        │  A     │     │  B     │     │  C     │
-        │(process│     │(process│     │(process│
-        └────┬───┘     └────┬───┘     └────┬───┘
-             │              │              │
-        ┌────▼──┐      ┌────▼──┐      ┌────▼──┐
-        │Alpaca │      │Alpaca │      │Alpaca │
-        │Paper#1│      │Paper#2│      │Paper#3│
-        └────┬──┘      └────┬──┘      └────┬──┘
-             └──────────────┼──────────────┘
-                            ▼
-                    ┌───────────────┐
-                    │  PostgreSQL   │
-                    └───────┬───────┘
-                            ▼
-                    기존 웹 프론트엔드 (REST API)
+┌──────────────────────────────────────────────────────────────┐
+│                       FastAPI 프로세스                          │
+│                                                                │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │              Strategy Manager (스레드)                 │    │
+│  │  - 프로세스 크래시 감시 (30s) / portfolio (5min)       │    │
+│  │  - daily_performance (장마감 16:05 ET)                 │    │
+│  └──────────┬──────────────┬────────────────────────────┘    │
+│             │              │                                   │
+│  ┌──────────▼──────────────────────────────────┐  POST /start │
+│  │   MarketDataHub (스레드)                      │  POST /stop  │
+│  │   시세용 키로 StockDataStream 1개 연결         │              │
+│  │   종목→전략큐 라우팅 (팬아웃)                  │              │
+│  └───┬───────────┬───────────┬──────────────────┘              │
+│      │ bar_queue │ bar_queue │ bar_queue (multiprocessing.Queue)│
+└──────┼───────────┼───────────┼─────────────────────────────────┘
+       │           │           │
+  ┌────▼───┐  ┌────▼───┐  ┌────▼───┐
+  │Strategy│  │Strategy│  │Strategy│  ... (독립 프로세스, 거래만 담당)
+  │  A     │  │  B     │  │  C     │
+  └────┬───┘  └────┬───┘  └────┬───┘
+       │ 거래/체결  │           │  (TradingClient/TradingStream, 전략별 키)
+  ┌────▼───┐  ┌────▼───┐  ┌────▼───┐
+  │Alpaca  │  │Alpaca  │  │Alpaca  │
+  │Paper#1 │  │Paper#2 │  │Paper#3 │   ← 거래용 (계정별 독립)
+  └────┬───┘  └────┬───┘  └────┬───┘
+       └───────────┼───────────┘
+                   ▼
+           ┌───────────────┐
+           │  PostgreSQL   │ → 기존 웹 프론트엔드 (REST API)
+           └───────────────┘
 ```
 
 **핵심 결정:**
-- Manager는 FastAPI와 같은 프로세스 내 백그라운드 스레드로 실행
+- Manager / MarketDataHub는 FastAPI와 같은 프로세스 내 백그라운드 스레드로 실행
 - start/stop API 요청 시 Manager가 직접 subprocess를 생성/종료 (DB 폴링 없음, 즉시 반영)
-- 각 전략 subprocess는 **`run()` 진입 후** 독립적으로 DB Engine / Alpaca 클라이언트 / WebSocket을 생성 (부모 공유 금지)
+- **시세/거래 키 분리 (무료 데이터 플랜의 동시 시세 연결 1개 한도 우회):**
+  - **시세**: `MarketDataHub`가 **시세용 별도 로그인 키**(`.env`의 `ALPACA_DATA_KEY/SECRET`)로 `StockDataStream` **1개**만 연결 → 받은 bar를 `multiprocessing.Queue`로 각 전략에 분배(팬아웃)
+  - **거래/체결**: 각 전략 프로세스가 **전략별 거래 키**(DB `strategies.alpaca_key/secret`)로 `TradingClient`/`TradingStream` 독립 연결 (체결은 계정별이라 한도 무관)
+- 각 전략 subprocess는 **`run()` 진입 후** 독립적으로 DB Engine / 거래 클라이언트를 생성 (부모 공유 금지)
   - ⚠️ `__init__`에서 생성하면 안 됨 — Manager(부모) 프로세스에서 만들어진 소켓·커넥션 풀 FD가 fork로 자식과 공유되어 SQLAlchemy/웹소켓이 깨짐
+  - 전략은 자체 `StockDataStream`을 열지 않고 `bar_queue`에서 시세를 소비
 - `self.processes` 딕셔너리는 APScheduler 스레드와 API 요청 스레드가 동시에 접근하므로 **`threading.Lock`으로 보호**
+- ⚠️ MarketDataHub는 단일 장애점 — 허브가 죽으면 전 전략 시세가 끊김 (허브가 매니저=FastAPI 프로세스와 운명을 같이하므로 시스템 다운과 동일 범위)
 
 ---
 
@@ -77,14 +84,15 @@ class BaseStrategy:
     def sync_state(self) -> None: ...               # Alpaca 잔고/미체결 주문 → self._positions 캐시
     def _prefetch_bars(self, symbols) -> None: ...  # 시작 시 1회 REST API로 과거 데이터 로드
     def _setup(self) -> None: ...                   # run() 진입 시 클라이언트/Engine/Stream 생성
-    def run(self) -> None: ...                      # _setup → sync_state → prefetch → 두 스트림 동시 실행
+    def run(self) -> None: ...                      # _setup → sync_state → prefetch → 체결스트림(스레드) + bar_queue 소비
     # self._positions: dict[str, position]          # 보유 포지션 캐시 (REST 재호출 금지, fill/sync로 갱신)
     # self._bar_buffer: dict[str, deque]            # 종목별 close 가격 롤링 버퍼
 ```
 
 **체결 기록(중요):** 주문 체결은 시세 스트림(`StockDataStream`)이 아니라 **`TradingStream`(trade updates 웹소켓)** 으로 들어온다.
 `run()`에서 `TradingStream.subscribe_trade_updates(handler)` 를 등록하고, `fill`/`partial_fill` 이벤트 수신 시 `on_order_filled()`를
-호출해 `trades` 테이블에 저장하고 `self._positions` 캐시를 갱신한다. 시세 스트림과 거래 스트림은 같은 이벤트 루프에서 함께 구동한다.
+호출해 `trades` 테이블에 저장하고 `self._positions` 캐시를 갱신한다. 시세는 `MarketDataHub`가 `bar_queue`로 분배하므로,
+전략은 거래 스트림(별도 스레드)과 `bar_queue` 소비 루프(메인)만 구동한다 — 자체 `StockDataStream`은 열지 않는다.
 
 **rate limit 방지:** `on_bar`는 매 bar마다 REST(`get_all_positions`)를 호출하지 않는다. 보유 여부는 `self._positions` 캐시로 판단하고,
 캐시는 시작 시 `sync_state()`와 이후 체결 이벤트로만 갱신한다. (Alpaca REST 분당 200회 제한 대응)
@@ -110,6 +118,19 @@ FastAPI lifespan 안에서 백그라운드 스레드로 실행.
   - `daily_return`(전일 대비 equity 변화율), `win_rate`(실현 익절/전체 청산 비율), `sharpe_ratio`(일별 수익률 표준편차 기반), `drawdown`(고점 대비 낙폭)
   - **이 잡이 없으면 핵심 목표인 "전략 성과 비교"가 동작하지 않음**
 - 모든 `self.processes` 접근은 `self._lock`(threading.Lock)으로 보호
+- `_launch_process` 시 전략용 `bar_queue` 생성 → 전략에 전달 + `hub.add_strategy(id, symbols, queue)` 등록
+- `stop`/크래시/failed 시 `hub.remove_strategy(id)` 로 라우팅 해제 (+ 큐에 None sentinel)
+
+### MarketDataHub (팬아웃 시세 허브)
+
+매니저 프로세스 내 백그라운드 스레드. **시세용 키 1개**로 `StockDataStream` 하나만 연결하고, 모든 전략이 보는 종목의 합집합을 구독해 받은 bar를 전략별 `multiprocessing.Queue`로 분배한다. 무료 데이터 플랜의 동시 시세 연결 1개 한도를 우회하는 핵심 장치.
+
+- `start()` / `stop()` — 시세 스트림 스레드 시작/정지
+- `add_strategy(strategy_id, symbols, queue)` — 종목→큐 라우팅 등록. **아무도 안 보던 종목만** `subscribe_bars`
+- `remove_strategy(strategy_id)` — 라우팅 해제. **아무도 안 보게 된 종목만** `unsubscribe_bars`
+- `_on_bar(bar)` — async 핸들러. 해당 종목 구독 전략 큐들에 `put_nowait`
+- 라우팅 테이블은 `threading.RLock`으로 보호 (스트림 스레드 ↔ 매니저 스레드 동시 접근)
+- ⚠️ `select_symbols()`는 매니저 프로세스에서도 호출되므로 무거운 자원(거래 클라이언트 등)에 의존하면 안 됨
 
 ### FastAPI 엔드포인트
 
@@ -129,13 +150,14 @@ POST /strategies/{id}/stop            Manager.stop_strategy() 직접 호출
 ## 4. 데이터 흐름
 
 ```
-1. 전략 run() → _setup() → DB Engine/TradingClient/StockDataStream/TradingStream 생성 (자식 프로세스에서)
+0. MarketDataHub → 시세용 키로 StockDataStream 1개 연결 (전 전략 공용, 매니저 프로세스)
+1. 전략 run() → _setup() → DB Engine/TradingClient/TradingStream 생성 (시세 스트림은 안 만듦)
 2.            → sync_state() → Alpaca 잔고/미체결 주문 → self._positions 캐시
-3.            → select_symbols() → 감시 종목 결정
+3.            → select_symbols() → 감시 종목 (매니저가 hub.add_strategy로 종목 등록 → 허브가 구독)
 4.            → _prefetch_bars() → REST API로 과거 N개 bar 로드 → _bar_buffer 채움
-5. StockDataStream 연결 → 실시간 bar 수신 → _bar_buffer에 append
-6. on_bar() → 버퍼로 지표 계산 + self._positions 캐시로 보유 판단 → 매매 신호 (REST 재호출 금지)
-7. 신호 발생 → Alpaca 주문 제출
+5. MarketDataHub → 실시간 bar 수신 → 해당 종목 구독 전략들의 bar_queue로 분배(put)
+6. 전략: bar_queue.get() → _process_bar() → _bar_buffer append + on_bar (캐시로 보유 판단, REST 금지)
+7. 신호 발생 → Alpaca 주문 제출 (전략별 거래 키)
 8. TradingStream → fill/partial_fill 이벤트 수신 → on_order_filled() → trades 저장 + _positions 캐시 갱신
 9. Manager(스레드) → 5분마다 계정 자산 조회 → portfolio_history 기록
 10. Manager(스레드) → 장 마감 후(16:05 ET) record_daily_performance() → daily_performance 기록
@@ -223,7 +245,8 @@ tradingbot/
 │   ├── base.py              # BaseStrategy (추상 클래스 + 공통 로직)
 │   └── ma_crossover.py      # 이동평균 크로스오버 예시 전략
 ├── manager/
-│   └── manager.py           # StrategyManager (lifespan 스레드)
+│   ├── manager.py           # StrategyManager (lifespan 스레드)
+│   └── market_data_hub.py   # MarketDataHub (시세 1연결 → 전략 큐 팬아웃)
 ├── api/
 │   ├── schemas.py           # Pydantic 응답 모델
 │   └── main.py              # FastAPI 앱 + lifespan + 엔드포인트

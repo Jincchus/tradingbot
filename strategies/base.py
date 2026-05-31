@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from alpaca.data.live import StockDataStream
 from alpaca.trading.client import TradingClient
 from alpaca.trading.stream import TradingStream
 from alpaca.trading.requests import GetOrdersRequest
@@ -37,17 +36,18 @@ class BaseStrategy(abc.ABC):
     BUFFER_SIZE = 200
 
     def __init__(self, strategy_id: int, name: str, api_key: str, api_secret: str,
-                 budget: float, run_interval: str):
+                 budget: float, run_interval: str, bar_queue=None):
         self.strategy_id = strategy_id
         self.name = name
         self.api_key = api_key
         self.api_secret = api_secret
         self.budget = budget
         self.run_interval = run_interval
+        # 시세는 MarketDataHub(중앙 1연결)가 이 큐로 분배한다. 전략은 자체 시세 연결을 열지 않음.
+        self.bar_queue = bar_queue
         self.logger = logging.getLogger(name)
         # 무거운 자원은 run()/_setup()에서 생성 (fork된 자식 프로세스에서만)
         self.trading_client: TradingClient | None = None
-        self.data_stream: StockDataStream | None = None
         self.trade_stream: TradingStream | None = None
         self.engine = None
         self._positions: dict = {}
@@ -55,9 +55,12 @@ class BaseStrategy(abc.ABC):
         self._bar_buffer: dict[str, deque] = {}
 
     def _setup(self) -> None:
-        """run() 진입(자식 프로세스) 후 호출. 부모에서 생성하면 소켓/커넥션 FD가 fork로 공유되어 깨짐."""
+        """run() 진입(자식 프로세스) 후 호출. 부모에서 생성하면 소켓/커넥션 FD가 fork로 공유되어 깨짐.
+
+        시세 스트림(StockDataStream)은 생성하지 않는다 — 시세는 허브에서 큐로 받는다.
+        거래(TradingClient)와 체결(TradingStream)만 전략별 키로 생성한다.
+        """
         self.trading_client = TradingClient(self.api_key, self.api_secret, paper=True)
-        self.data_stream = StockDataStream(self.api_key, self.api_secret)
         self.trade_stream = TradingStream(self.api_key, self.api_secret, paper=True)
         self.engine = create_engine_for_process()
 
@@ -117,11 +120,12 @@ class BaseStrategy(abc.ABC):
             "buying_power": float(account.buying_power),
         }
 
-    async def _bar_handler(self, bar) -> None:
+    def _process_bar(self, bar) -> None:
+        """허브 큐에서 받은 bar 처리 (동기). 예외가 소비 루프를 죽이지 않도록 격리."""
         try:
             if bar.symbol in self._bar_buffer:
                 self._bar_buffer[bar.symbol].append(float(bar.close))
-            self.on_bar(bar)  # 핸들러 예외가 스트림을 죽이지 않도록 격리
+            self.on_bar(bar)
         except Exception:
             self.logger.exception(f"on_bar failed for {getattr(bar, 'symbol', '?')}")
 
@@ -147,6 +151,11 @@ class BaseStrategy(abc.ABC):
         self.trade_stream.subscribe_trade_updates(self._trade_update_handler)
         threading.Thread(target=self.trade_stream.run, daemon=True).start()
 
-        # 시세 스트림(StockDataStream)은 메인 스레드에서 구동 (블로킹)
-        self.data_stream.subscribe_bars(self._bar_handler, *symbols)
-        self.data_stream.run()
+        # 시세는 허브가 bar_queue로 분배 → 큐 소비 (None sentinel 수신 시 종료)
+        self.logger.info(f"consuming bars from hub queue for {symbols}")
+        while True:
+            bar = self.bar_queue.get()
+            if bar is None:
+                self.logger.info("received stop sentinel, exiting")
+                break
+            self._process_bar(bar)

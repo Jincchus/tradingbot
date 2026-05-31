@@ -16,7 +16,8 @@ def db_engine():
 @pytest.fixture
 def manager(db_engine):
     from manager.manager import StrategyManager
-    with patch("manager.manager.create_engine_for_process", return_value=db_engine):
+    with patch("manager.manager.create_engine_for_process", return_value=db_engine), \
+         patch("manager.manager.MarketDataHub"):  # 시세 허브는 mock
         m = StrategyManager()
     return m
 
@@ -49,6 +50,31 @@ def test_stop_strategy_terminates_process(manager, running_strategy, db_engine):
 
     mock_proc.terminate.assert_called_once()
     assert 1 not in manager.processes
+
+def test_launch_process_registers_with_hub(manager, running_strategy, db_engine):
+    with patch("manager.manager.multiprocessing.Process"), \
+         patch.object(manager, "engine", db_engine):
+        with Session(db_engine) as session:
+            st = session.get(Strategy, 1)
+            manager._launch_process(st)
+
+    manager.hub.add_strategy.assert_called_once()
+    sid, symbols, queue = manager.hub.add_strategy.call_args[0]
+    assert sid == 1
+    assert "AAPL" in symbols  # MACrossover WATCHLIST
+    assert 1 in manager.processes and manager.processes[1]["queue"] is queue
+
+def test_stop_strategy_removes_from_hub_and_sentinel(manager, running_strategy, db_engine):
+    mock_proc = MagicMock()
+    q = MagicMock()
+    manager.processes[1] = {"process": mock_proc, "restart_count": 0, "queue": q}
+
+    with patch.object(manager, "engine", db_engine):
+        manager.stop_strategy(1)
+
+    manager.hub.remove_strategy.assert_called_once_with(1)
+    q.put_nowait.assert_called_once_with(None)  # 소비 루프 종료 sentinel
+    mock_proc.terminate.assert_called_once()
 
 def test_monitor_crashes_restarts_dead_process(manager, running_strategy, db_engine):
     dead_proc = MagicMock()

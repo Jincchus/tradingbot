@@ -15,7 +15,6 @@ def db_engine():
 def strategy(db_engine):
     from strategies.ma_crossover import MACrossoverStrategy
     with patch("strategies.base.TradingClient"), \
-         patch("strategies.base.StockDataStream"), \
          patch("strategies.base.TradingStream"), \
          patch("strategies.base.create_engine_for_process", return_value=db_engine):
         s = MACrossoverStrategy(

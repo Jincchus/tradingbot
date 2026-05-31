@@ -25,7 +25,6 @@ def concrete_strategy(db_engine):
             pass
 
     with patch("strategies.base.TradingClient"), \
-         patch("strategies.base.StockDataStream"), \
          patch("strategies.base.TradingStream"), \
          patch("strategies.base.create_engine_for_process", return_value=db_engine):
         s = TestStrategy(
@@ -33,8 +32,19 @@ def concrete_strategy(db_engine):
             api_key="key", api_secret="secret",
             budget=10000.0, run_interval="1m",
         )
-        s._setup()  # 클라이언트/Engine/Stream을 run() 대신 여기서 mock으로 생성
+        s._setup()  # trading_client/trade_stream/engine를 run() 대신 여기서 mock으로 생성
     return s
+
+def test_process_bar_appends_and_calls_on_bar(concrete_strategy):
+    concrete_strategy._bar_buffer["AAPL"] = deque([100.0], maxlen=200)
+    seen = {}
+    concrete_strategy.on_bar = lambda bar: seen.setdefault("bar", bar)
+
+    bar = MagicMock(); bar.symbol = "AAPL"; bar.close = 101.0
+    concrete_strategy._process_bar(bar)
+
+    assert list(concrete_strategy._bar_buffer["AAPL"]) == [100.0, 101.0]
+    assert seen["bar"] is bar
 
 def test_sync_state_loads_positions(concrete_strategy):
     mock_position = MagicMock()

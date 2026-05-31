@@ -2,6 +2,7 @@ import importlib
 import inspect
 import logging
 import multiprocessing
+import os
 import statistics
 import threading
 from collections import defaultdict, deque
@@ -13,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from db.database import create_engine_for_process
 from db.models import Strategy, Trade, PortfolioHistory, DailyPerformance
+from manager.market_data_hub import MarketDataHub
 
 logger = logging.getLogger("manager")
 
@@ -25,8 +27,14 @@ class StrategyManager:
         self.processes: dict[int, dict] = {}
         self.scheduler = BackgroundScheduler()
         self._lock = threading.RLock()  # processes 딕셔너리를 스케줄러/요청 스레드 동시 접근으로부터 보호
+        # 시세는 거래용 키와 분리된 별도 Alpaca 로그인 키로 1개만 연결 (팬아웃 허브)
+        self.hub = MarketDataHub(
+            os.getenv("ALPACA_DATA_KEY", ""),
+            os.getenv("ALPACA_DATA_SECRET", ""),
+        )
 
     def start(self) -> None:
+        self.hub.start()
         self.scheduler.add_job(self._monitor_crashes, "interval", seconds=30)
         self.scheduler.add_job(self.record_portfolio_history, "interval", minutes=5)
         # 장 마감 후(평일 16:05 ET) 일별 성과 기록 — 성과 비교의 핵심 데이터
@@ -43,8 +51,9 @@ class StrategyManager:
     def stop(self) -> None:
         self.scheduler.shutdown(wait=False)
         with self._lock:
-            for info in self.processes.values():
-                self._terminate_process(info["process"])
+            for strategy_id in list(self.processes):
+                self._teardown_process(strategy_id)
+        self.hub.stop()
 
     def start_strategy(self, strategy_id: int) -> None:
         with self._lock:
@@ -66,9 +75,22 @@ class StrategyManager:
                 strategy = session.get(Strategy, strategy_id)
                 strategy.status = "stopped"
                 session.commit()
-            if strategy_id in self.processes:
-                self._terminate_process(self.processes[strategy_id]["process"])
-                del self.processes[strategy_id]
+            self._teardown_process(strategy_id)
+
+    def _teardown_process(self, strategy_id: int) -> None:
+        """전략 프로세스 정리: 허브 라우팅 해제 → 큐 sentinel → 프로세스 종료. _lock 하에서 호출."""
+        info = self.processes.get(strategy_id)
+        if info is None:
+            return
+        self.hub.remove_strategy(strategy_id)
+        q = info.get("queue")
+        if q is not None:
+            try:
+                q.put_nowait(None)  # 소비 루프에 종료 신호
+            except Exception:
+                pass
+        self._terminate_process(info["process"])
+        del self.processes[strategy_id]
 
     def _terminate_process(self, proc) -> None:
         """SIGTERM → 5s 대기 → 미종료 시 SIGKILL. join으로 좀비(defunct) reap.
@@ -86,6 +108,7 @@ class StrategyManager:
     def _launch_process(self, strategy: Strategy, restart_count: int = 0) -> None:
         # 항상 _lock 하에서 호출됨 (start/start_strategy/_monitor_crashes)
         cls = self._load_strategy_class(strategy.strategy_type)
+        bar_queue = multiprocessing.Queue()
         instance = cls(
             strategy_id=strategy.id,
             name=strategy.name,
@@ -93,12 +116,21 @@ class StrategyManager:
             api_secret=strategy.alpaca_secret,
             budget=float(strategy.budget),
             run_interval=strategy.run_interval,
+            bar_queue=bar_queue,
         )
+        # select_symbols는 매니저 프로세스에서도 호출되므로 무거운 자원에 의존하면 안 됨
+        symbols = instance.select_symbols()
         proc = multiprocessing.Process(target=instance.run, daemon=True)
         proc.start()
         # restart_count는 재시작 시에도 보존되어야 함 (덮어쓰면 무한 재시작)
-        self.processes[strategy.id] = {"process": proc, "restart_count": restart_count}
-        logger.info(f"Launched {strategy.name} (type={strategy.strategy_type}) pid={proc.pid}")
+        self.processes[strategy.id] = {
+            "process": proc, "restart_count": restart_count,
+            "queue": bar_queue, "symbols": symbols,
+        }
+        # 허브에 종목 등록 → 허브가 시세 1연결로 받아 이 큐로 분배
+        self.hub.add_strategy(strategy.id, symbols, bar_queue)
+        logger.info(f"Launched {strategy.name} (type={strategy.strategy_type}) "
+                    f"pid={proc.pid} symbols={symbols}")
 
     def _load_strategy_class(self, strategy_type: str):
         module = importlib.import_module(f"strategies.{strategy_type}")
@@ -114,6 +146,7 @@ class StrategyManager:
                 if info["process"].is_alive():
                     continue
                 strategy = session.get(Strategy, strategy_id)
+                self.hub.remove_strategy(strategy_id)  # 죽은 전략의 라우팅 제거 (재시작 시 새로 등록)
                 if info["restart_count"] < MAX_RESTARTS:
                     next_count = info["restart_count"] + 1
                     logger.warning(f"{strategy.name} crashed, restarting ({next_count}/{MAX_RESTARTS})")
