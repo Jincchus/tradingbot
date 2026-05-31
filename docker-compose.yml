@@ -1,0 +1,33 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: tradingbot
+    volumes:
+      - tradingbot_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres:password@db:5432/tradingbot
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  tradingbot_pgdata:
+    external: true
