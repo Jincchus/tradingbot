@@ -2,7 +2,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import List
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
@@ -14,6 +14,17 @@ from api.schemas import (StrategyResponse, TradeResponse,
                          PortfolioHistoryResponse, DailyPerformanceResponse,
                          PositionResponse)
 from manager.manager import StrategyManager
+
+# Token authentication
+_BOT_API_TOKEN = os.getenv("BOT_API_TOKEN", "")
+
+def require_token(authorization: str = Header(default="")) -> None:
+    """Validates Bearer token. If BOT_API_TOKEN is not set, auth is skipped (dev mode)."""
+    if not _BOT_API_TOKEN:
+        return
+    if authorization != f"Bearer {_BOT_API_TOKEN}":
+        raise HTTPException(status_code=401, detail="unauthorized")
+
 
 _manager: StrategyManager | None = None
 
@@ -53,13 +64,13 @@ def get_manager() -> StrategyManager:
     return _manager
 
 
-@app.get("/strategies", response_model=List[StrategyResponse])
+@app.get("/strategies", response_model=List[StrategyResponse], dependencies=[Depends(require_token)])
 def list_strategies(engine: Engine = Depends(get_engine)):
     with Session(engine) as session:
         return session.query(Strategy).all()
 
 
-@app.get("/strategies/{id}/performance", response_model=List[DailyPerformanceResponse])
+@app.get("/strategies/{id}/performance", response_model=List[DailyPerformanceResponse], dependencies=[Depends(require_token)])
 def get_performance(id: int, engine: Engine = Depends(get_engine)):
     with Session(engine) as session:
         if not session.get(Strategy, id):
@@ -69,7 +80,7 @@ def get_performance(id: int, engine: Engine = Depends(get_engine)):
                 .order_by(DailyPerformance.date).all())
 
 
-@app.get("/strategies/{id}/portfolio", response_model=List[PortfolioHistoryResponse])
+@app.get("/strategies/{id}/portfolio", response_model=List[PortfolioHistoryResponse], dependencies=[Depends(require_token)])
 def get_portfolio(id: int, engine: Engine = Depends(get_engine)):
     with Session(engine) as session:
         if not session.get(Strategy, id):
@@ -79,7 +90,7 @@ def get_portfolio(id: int, engine: Engine = Depends(get_engine)):
                 .order_by(PortfolioHistory.timestamp).all())
 
 
-@app.get("/strategies/{id}/trades", response_model=List[TradeResponse])
+@app.get("/strategies/{id}/trades", response_model=List[TradeResponse], dependencies=[Depends(require_token)])
 def get_trades(id: int, engine: Engine = Depends(get_engine)):
     with Session(engine) as session:
         if not session.get(Strategy, id):
@@ -89,7 +100,7 @@ def get_trades(id: int, engine: Engine = Depends(get_engine)):
                 .order_by(Trade.filled_at.desc()).all())
 
 
-@app.get("/strategies/{id}/positions", response_model=List[PositionResponse])
+@app.get("/strategies/{id}/positions", response_model=List[PositionResponse], dependencies=[Depends(require_token)])
 def get_positions(id: int, engine: Engine = Depends(get_engine)):
     with Session(engine) as session:
         strategy = session.get(Strategy, id)
@@ -114,7 +125,7 @@ def get_positions(id: int, engine: Engine = Depends(get_engine)):
     ]
 
 
-@app.post("/strategies/{id}/start")
+@app.post("/strategies/{id}/start", dependencies=[Depends(require_token)])
 def start_strategy(id: int, engine: Engine = Depends(get_engine),
                    mgr: StrategyManager = Depends(get_manager)):
     with Session(engine) as session:
@@ -124,7 +135,7 @@ def start_strategy(id: int, engine: Engine = Depends(get_engine),
     return {"message": "started"}
 
 
-@app.post("/strategies/{id}/stop")
+@app.post("/strategies/{id}/stop", dependencies=[Depends(require_token)])
 def stop_strategy(id: int, engine: Engine = Depends(get_engine),
                   mgr: StrategyManager = Depends(get_manager)):
     with Session(engine) as session:

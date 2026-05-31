@@ -1,3 +1,6 @@
+import os
+os.environ.setdefault("BOT_API_TOKEN", "")  # disable token auth in tests
+
 import pytest
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
