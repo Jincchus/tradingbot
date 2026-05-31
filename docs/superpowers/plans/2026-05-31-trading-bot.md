@@ -48,6 +48,7 @@ tradingbot/
 **Files:**
 - Create: `requirements.txt`
 - Create: `.env.example`
+- Create: `.gitignore`
 - Create: 각 패키지 `__init__.py`
 
 - [ ] **Step 1: requirements.txt 작성**
@@ -70,16 +71,29 @@ pytest-mock>=3.12.0
 
 ```
 DATABASE_URL=postgresql://postgres:password@localhost:5432/tradingbot
+# 웹 프론트엔드 origin (CORS 허용). 쉼표로 다중 지정.
+CORS_ORIGINS=http://localhost:3000
 ```
 
-- [ ] **Step 3: 디렉토리 및 __init__.py 생성**
+- [ ] **Step 3: .gitignore 작성** (시크릿/빌드 산출물 커밋 방지)
+
+```
+.env
+.venv/
+__pycache__/
+*.pyc
+logs/*.log
+.pytest_cache/
+```
+
+- [ ] **Step 4: 디렉토리 및 __init__.py 생성**
 
 ```bash
 mkdir -p db strategies manager api tests logs
 touch db/__init__.py strategies/__init__.py manager/__init__.py api/__init__.py tests/__init__.py logs/.gitkeep
 ```
 
-- [ ] **Step 4: 패키지 설치**
+- [ ] **Step 5: 패키지 설치**
 
 ```bash
 python3 -m venv .venv
@@ -87,7 +101,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-- [ ] **Step 5: 설치 확인**
+- [ ] **Step 6: 설치 확인**
 
 ```bash
 python -c "import alpaca; import fastapi; import sqlalchemy; print('OK')"
@@ -95,11 +109,11 @@ python -c "import alpaca; import fastapi; import sqlalchemy; print('OK')"
 
 Expected: `OK`
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit** (`.env`은 절대 add 하지 않음 — `.gitignore`로 차단됨)
 
 ```bash
 git init
-git add requirements.txt .env.example db/__init__.py strategies/__init__.py manager/__init__.py api/__init__.py tests/__init__.py logs/.gitkeep
+git add .gitignore requirements.txt .env.example db/__init__.py strategies/__init__.py manager/__init__.py api/__init__.py tests/__init__.py logs/.gitkeep
 git commit -m "Chore: initialize project structure and dependencies"
 ```
 
@@ -353,12 +367,14 @@ def concrete_strategy(db_engine):
 
     with patch("strategies.base.TradingClient"), \
          patch("strategies.base.StockDataStream"), \
+         patch("strategies.base.TradingStream"), \
          patch("strategies.base.create_engine_for_process", return_value=db_engine):
         s = TestStrategy(
             strategy_id=1, name="test",
             api_key="key", api_secret="secret",
             budget=10000.0, run_interval="1m",
         )
+        s._setup()  # 클라이언트/Engine/Stream을 run() 대신 여기서 mock으로 생성
     return s
 
 def test_sync_state_loads_positions(concrete_strategy):
@@ -370,6 +386,26 @@ def test_sync_state_loads_positions(concrete_strategy):
     concrete_strategy.sync_state()
 
     assert "AAPL" in concrete_strategy._positions
+
+def test_on_order_filled_updates_position_cache(concrete_strategy, db_engine):
+    with Session(db_engine) as session:
+        session.add(Strategy(
+            id=1, name="t", strategy_type="test", alpaca_key="k", alpaca_secret="s",
+            budget=Decimal("10000"), status="running", run_interval="1m",
+        ))
+        session.commit()
+
+    buy = MagicMock()
+    buy.symbol = "AAPL"; buy.side.value = "buy"; buy.filled_qty = "10"
+    buy.filled_avg_price = "150"; buy.id = "o1"; buy.filled_at = datetime.utcnow()
+    concrete_strategy.on_order_filled(buy)
+    assert "AAPL" in concrete_strategy._positions
+
+    sell = MagicMock()
+    sell.symbol = "AAPL"; sell.side.value = "sell"; sell.filled_qty = "10"
+    sell.filled_avg_price = "160"; sell.id = "o2"; sell.filled_at = datetime.utcnow()
+    concrete_strategy.on_order_filled(sell)
+    assert "AAPL" not in concrete_strategy._positions
 
 def test_prefetch_bars_fills_buffer(concrete_strategy):
     mock_df = MagicMock()
@@ -432,20 +468,37 @@ Expected: `ImportError` (strategies/base.py 없음)
 ```python
 import abc
 import logging
+import threading
 from collections import deque
 from datetime import datetime, timedelta
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.live import StockDataStream
 from alpaca.trading.client import TradingClient
+from alpaca.trading.stream import TradingStream
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.enums import QueryOrderStatus
 from sqlalchemy.orm import Session
 
 from db.database import create_engine_for_process
 from db.models import Trade
+
+
+def timeframe_for(run_interval: str) -> TimeFrame:
+    """run_interval 문자열 → 프리페치용 Alpaca TimeFrame.
+
+    실시간 스트림 bar는 Alpaca 한계상 항상 1분봉으로 들어오므로, 멀티분/일봉 의사결정은
+    전략이 버퍼를 직접 집계해 처리한다. 분 미만(스캘핑)은 현 단계 범위 외(설계 9장).
+    """
+    return {
+        "1m": TimeFrame(1, TimeFrameUnit.Minute),
+        "5m": TimeFrame(5, TimeFrameUnit.Minute),
+        "15m": TimeFrame(15, TimeFrameUnit.Minute),
+        "1h": TimeFrame(1, TimeFrameUnit.Hour),
+        "1d": TimeFrame(1, TimeFrameUnit.Day),
+    }.get(run_interval, TimeFrame(1, TimeFrameUnit.Minute))
 
 
 class BaseStrategy(abc.ABC):
@@ -459,13 +512,22 @@ class BaseStrategy(abc.ABC):
         self.api_secret = api_secret
         self.budget = budget
         self.run_interval = run_interval
-        self.trading_client = TradingClient(api_key, api_secret, paper=True)
-        self.stream = StockDataStream(api_key, api_secret)
-        self.engine = create_engine_for_process()
         self.logger = logging.getLogger(name)
+        # 무거운 자원은 run()/_setup()에서 생성 (fork된 자식 프로세스에서만)
+        self.trading_client: TradingClient | None = None
+        self.data_stream: StockDataStream | None = None
+        self.trade_stream: TradingStream | None = None
+        self.engine = None
         self._positions: dict = {}
         self._open_orders: dict = {}
         self._bar_buffer: dict[str, deque] = {}
+
+    def _setup(self) -> None:
+        """run() 진입(자식 프로세스) 후 호출. 부모에서 생성하면 소켓/커넥션 FD가 fork로 공유되어 깨짐."""
+        self.trading_client = TradingClient(self.api_key, self.api_secret, paper=True)
+        self.data_stream = StockDataStream(self.api_key, self.api_secret)
+        self.trade_stream = TradingStream(self.api_key, self.api_secret, paper=True)
+        self.engine = create_engine_for_process()
 
     def sync_state(self) -> None:
         positions = self.trading_client.get_all_positions()
@@ -480,8 +542,8 @@ class BaseStrategy(abc.ABC):
         for symbol in symbols:
             request = StockBarsRequest(
                 symbol_or_symbols=symbol,
-                timeframe=TimeFrame.Minute,
-                start=datetime.utcnow() - timedelta(hours=6),
+                timeframe=timeframe_for(self.run_interval),
+                start=datetime.utcnow() - timedelta(days=5),
                 limit=self.BUFFER_SIZE,
             )
             df = hist_client.get_stock_bars(request).df
@@ -494,6 +556,7 @@ class BaseStrategy(abc.ABC):
 
     @abc.abstractmethod
     def on_bar(self, bar) -> None:
+        """버퍼 + self._positions 캐시로 판단. ⚠️ 매 bar마다 REST(get_all_positions) 호출 금지."""
         ...
 
     def on_order_filled(self, order) -> None:
@@ -508,6 +571,11 @@ class BaseStrategy(abc.ABC):
                 filled_at=order.filled_at,
             ))
             session.commit()
+        # 포지션 캐시 경량 갱신 (다음 bar 판단에 반영, REST 재호출 없이)
+        if order.side.value == "buy":
+            self._positions[order.symbol] = order
+        else:
+            self._positions.pop(order.symbol, None)
 
     def get_metrics(self) -> dict:
         account = self.trading_client.get_account()
@@ -517,23 +585,39 @@ class BaseStrategy(abc.ABC):
             "buying_power": float(account.buying_power),
         }
 
+    async def _bar_handler(self, bar) -> None:
+        try:
+            if bar.symbol in self._bar_buffer:
+                self._bar_buffer[bar.symbol].append(float(bar.close))
+            self.on_bar(bar)  # 핸들러 예외가 스트림을 죽이지 않도록 격리
+        except Exception:
+            self.logger.exception(f"on_bar failed for {getattr(bar, 'symbol', '?')}")
+
+    async def _trade_update_handler(self, data) -> None:
+        try:
+            if data.event in ("fill", "partial_fill"):
+                self.on_order_filled(data.order)
+        except Exception:
+            self.logger.exception("trade update handler failed")
+
     def run(self) -> None:
         logging.basicConfig(
             filename=f"logs/{self.name}.log",
             level=logging.INFO,
             format="%(asctime)s %(levelname)s %(message)s",
         )
+        self._setup()
         self.sync_state()
         symbols = self.select_symbols()
         self._prefetch_bars(symbols)
 
-        async def bar_handler(bar):
-            if bar.symbol in self._bar_buffer:
-                self._bar_buffer[bar.symbol].append(float(bar.close))
-            self.on_bar(bar)
+        # 체결 스트림(TradingStream)은 별도 스레드에서 자체 이벤트 루프로 구동
+        self.trade_stream.subscribe_trade_updates(self._trade_update_handler)
+        threading.Thread(target=self.trade_stream.run, daemon=True).start()
 
-        self.stream.subscribe_bars(bar_handler, *symbols)
-        self.stream.run()
+        # 시세 스트림(StockDataStream)은 메인 스레드에서 구동 (블로킹)
+        self.data_stream.subscribe_bars(self._bar_handler, *symbols)
+        self.data_stream.run()
 ```
 
 - [ ] **Step 4: 테스트 실행 (통과 확인)**
@@ -542,13 +626,13 @@ class BaseStrategy(abc.ABC):
 python -m pytest tests/test_base_strategy.py -v
 ```
 
-Expected: `4 passed`
+Expected: `5 passed`
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add strategies/base.py tests/test_base_strategy.py
-git commit -m "Feat: add BaseStrategy with prefetch buffer"
+git commit -m "Feat: add BaseStrategy (run()-scoped resources, TradingStream fills, position cache)"
 ```
 
 ---
@@ -581,12 +665,14 @@ def strategy(db_engine):
     from strategies.ma_crossover import MACrossoverStrategy
     with patch("strategies.base.TradingClient"), \
          patch("strategies.base.StockDataStream"), \
+         patch("strategies.base.TradingStream"), \
          patch("strategies.base.create_engine_for_process", return_value=db_engine):
         s = MACrossoverStrategy(
             strategy_id=1, name="ma_crossover",
             api_key="key", api_secret="secret",
             budget=10000.0, run_interval="1m",
         )
+        s._setup()  # trading_client 등을 mock으로 생성
     return s
 
 def _make_buffer(trend: str) -> deque:
@@ -700,8 +786,9 @@ class MACrossoverStrategy(BaseStrategy):
         is_death_cross = (short_ma.iloc[-1] < long_ma.iloc[-1] and
                           short_ma.iloc[-2] >= long_ma.iloc[-2])
 
-        positions = self.trading_client.get_all_positions()
-        has_position = any(p.symbol == symbol for p in positions)
+        # 보유 여부는 캐시로 판단 (매 bar REST 호출 금지 — rate limit 방지).
+        # 캐시는 sync_state()와 체결 이벤트(on_order_filled)로 갱신됨.
+        has_position = symbol in self._positions
 
         if is_golden_cross and not has_position:
             qty = int(self.budget * self.POSITION_SIZE / float(bar.close))
@@ -751,7 +838,7 @@ from unittest.mock import MagicMock, patch
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from db.database import Base
-from db.models import Strategy, PortfolioHistory
+from db.models import Strategy, PortfolioHistory, DailyPerformance
 from decimal import Decimal
 from datetime import datetime
 
@@ -839,6 +926,45 @@ def test_record_portfolio_history_saves_to_db(manager, running_strategy, db_engi
         records = session.query(PortfolioHistory).all()
         assert len(records) == 1
         assert float(records[0].equity) == 10500.00
+
+def test_start_strategy_idempotent_when_alive(manager, running_strategy, db_engine):
+    alive_proc = MagicMock()
+    alive_proc.is_alive.return_value = True
+    manager.processes[1] = {"process": alive_proc, "restart_count": 0}
+
+    with patch.object(manager, "_launch_process") as mock_launch, \
+         patch.object(manager, "engine", db_engine):
+        manager.start_strategy(running_strategy.id)
+
+    mock_launch.assert_not_called()  # 이미 실행 중 → 중복 실행 안 함
+
+def test_monitor_crashes_preserves_restart_count(manager, running_strategy, db_engine):
+    dead_proc = MagicMock()
+    dead_proc.is_alive.return_value = False
+    manager.processes[1] = {"process": dead_proc, "restart_count": 1}
+
+    with patch.object(manager, "_launch_process") as mock_launch, \
+         patch.object(manager, "engine", db_engine):
+        manager._monitor_crashes()
+
+    # 재시작 시 카운터가 0으로 리셋되지 않고 +1로 전달돼야 함
+    assert mock_launch.call_args.kwargs["restart_count"] == 2
+
+def test_record_daily_performance_saves_to_db(manager, running_strategy, db_engine):
+    mock_account = MagicMock()
+    mock_account.equity = "10200.00"
+
+    with patch("manager.manager.TradingClient") as mock_client_cls, \
+         patch.object(manager, "engine", db_engine):
+        mock_client_cls.return_value.get_account.return_value = mock_account
+        manager.record_daily_performance()
+
+    with Session(db_engine) as session:
+        rows = session.query(DailyPerformance).all()
+        assert len(rows) == 1
+        assert float(rows[0].total_value) == 10200.00
+        # 첫날: 예산(10000) 대비 (10200-10000)/10000 = 0.02
+        assert abs(float(rows[0].daily_return) - 0.02) < 1e-6
 ```
 
 - [ ] **Step 2: 테스트 실행 (실패 확인)**
@@ -856,16 +982,21 @@ import importlib
 import inspect
 import logging
 import multiprocessing
-from datetime import datetime
+import statistics
+import threading
+from collections import defaultdict, deque
+from datetime import datetime, date
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from alpaca.trading.client import TradingClient
 from sqlalchemy.orm import Session
 
 from db.database import create_engine_for_process
-from db.models import Strategy, PortfolioHistory
+from db.models import Strategy, Trade, PortfolioHistory, DailyPerformance
 
 logger = logging.getLogger("manager")
+
+MAX_RESTARTS = 3
 
 
 class StrategyManager:
@@ -873,39 +1004,54 @@ class StrategyManager:
         self.engine = create_engine_for_process()
         self.processes: dict[int, dict] = {}
         self.scheduler = BackgroundScheduler()
+        self._lock = threading.RLock()  # processes 딕셔너리를 스케줄러/요청 스레드 동시 접근으로부터 보호
 
     def start(self) -> None:
         self.scheduler.add_job(self._monitor_crashes, "interval", seconds=30)
         self.scheduler.add_job(self.record_portfolio_history, "interval", minutes=5)
+        # 장 마감 후(평일 16:05 ET) 일별 성과 기록 — 성과 비교의 핵심 데이터
+        self.scheduler.add_job(
+            self.record_daily_performance, "cron",
+            day_of_week="mon-fri", hour=16, minute=5, timezone="America/New_York",
+        )
         self.scheduler.start()
-        with Session(self.engine) as session:
+        with self._lock, Session(self.engine) as session:
             running = session.query(Strategy).filter(Strategy.status == "running").all()
             for strategy in running:
                 self._launch_process(strategy)
 
     def stop(self) -> None:
         self.scheduler.shutdown(wait=False)
-        for info in self.processes.values():
-            info["process"].terminate()
+        with self._lock:
+            for info in self.processes.values():
+                info["process"].terminate()
 
     def start_strategy(self, strategy_id: int) -> None:
-        with Session(self.engine) as session:
-            strategy = session.get(Strategy, strategy_id)
-            strategy.status = "running"
-            session.commit()
-            session.refresh(strategy)
-            self._launch_process(strategy)
+        with self._lock:
+            # 멱등성: 이미 살아있으면 중복 실행 금지 (좀비 프로세스 방지)
+            existing = self.processes.get(strategy_id)
+            if existing and existing["process"].is_alive():
+                logger.info(f"strategy {strategy_id} already running, skip")
+                return
+            with Session(self.engine) as session:
+                strategy = session.get(Strategy, strategy_id)
+                strategy.status = "running"
+                session.commit()
+                session.refresh(strategy)
+                self._launch_process(strategy)
 
     def stop_strategy(self, strategy_id: int) -> None:
-        with Session(self.engine) as session:
-            strategy = session.get(Strategy, strategy_id)
-            strategy.status = "stopped"
-            session.commit()
-        if strategy_id in self.processes:
-            self.processes[strategy_id]["process"].terminate()
-            del self.processes[strategy_id]
+        with self._lock:
+            with Session(self.engine) as session:
+                strategy = session.get(Strategy, strategy_id)
+                strategy.status = "stopped"
+                session.commit()
+            if strategy_id in self.processes:
+                self.processes[strategy_id]["process"].terminate()
+                del self.processes[strategy_id]
 
-    def _launch_process(self, strategy: Strategy) -> None:
+    def _launch_process(self, strategy: Strategy, restart_count: int = 0) -> None:
+        # 항상 _lock 하에서 호출됨 (start/start_strategy/_monitor_crashes)
         cls = self._load_strategy_class(strategy.strategy_type)
         instance = cls(
             strategy_id=strategy.id,
@@ -917,7 +1063,8 @@ class StrategyManager:
         )
         proc = multiprocessing.Process(target=instance.run, daemon=True)
         proc.start()
-        self.processes[strategy.id] = {"process": proc, "restart_count": 0}
+        # restart_count는 재시작 시에도 보존되어야 함 (덮어쓰면 무한 재시작)
+        self.processes[strategy.id] = {"process": proc, "restart_count": restart_count}
         logger.info(f"Launched {strategy.name} (type={strategy.strategy_type}) pid={proc.pid}")
 
     def _load_strategy_class(self, strategy_type: str):
@@ -929,36 +1076,117 @@ class StrategyManager:
         raise ValueError(f"No BaseStrategy subclass in strategies/{strategy_type}.py")
 
     def _monitor_crashes(self) -> None:
-        with Session(self.engine) as session:
+        with self._lock, Session(self.engine) as session:
             for strategy_id, info in list(self.processes.items()):
-                if not info["process"].is_alive():
-                    strategy = session.get(Strategy, strategy_id)
-                    if info["restart_count"] < 3:
-                        logger.warning(f"{strategy.name} crashed, restarting ({info['restart_count']+1}/3)")
-                        info["restart_count"] += 1
-                        self._launch_process(strategy)
-                    else:
-                        logger.error(f"{strategy.name} failed 3 times, marking failed")
-                        strategy.status = "failed"
-                        session.commit()
-                        del self.processes[strategy_id]
+                if info["process"].is_alive():
+                    continue
+                strategy = session.get(Strategy, strategy_id)
+                if info["restart_count"] < MAX_RESTARTS:
+                    next_count = info["restart_count"] + 1
+                    logger.warning(f"{strategy.name} crashed, restarting ({next_count}/{MAX_RESTARTS})")
+                    self._launch_process(strategy, restart_count=next_count)  # 카운터 보존
+                else:
+                    logger.error(f"{strategy.name} failed {MAX_RESTARTS} times, marking failed")
+                    strategy.status = "failed"
+                    session.commit()
+                    del self.processes[strategy_id]
 
     def record_portfolio_history(self) -> None:
         with Session(self.engine) as session:
             running = session.query(Strategy).filter(Strategy.status == "running").all()
             for strategy in running:
-                client = TradingClient(strategy.alpaca_key, strategy.alpaca_secret, paper=True)
-                account = client.get_account()
-                positions = client.get_all_positions()
-                unrealized_pnl = sum(float(p.unrealized_pl) for p in positions)
-                session.add(PortfolioHistory(
-                    strategy_id=strategy.id,
-                    timestamp=datetime.utcnow(),
-                    equity=float(account.equity),
-                    cash=float(account.cash),
-                    unrealized_pnl=unrealized_pnl,
-                ))
+                try:  # 한 전략의 키 오류가 다른 전략 기록을 막지 않도록 격리
+                    client = TradingClient(strategy.alpaca_key, strategy.alpaca_secret, paper=True)
+                    account = client.get_account()
+                    positions = client.get_all_positions()
+                    unrealized_pnl = sum(float(p.unrealized_pl) for p in positions)
+                    session.add(PortfolioHistory(
+                        strategy_id=strategy.id,
+                        timestamp=datetime.utcnow(),
+                        equity=float(account.equity),
+                        cash=float(account.cash),
+                        unrealized_pnl=unrealized_pnl,
+                    ))
+                except Exception:
+                    logger.exception(f"portfolio_history failed for strategy {strategy.id}")
             session.commit()
+
+    def record_daily_performance(self) -> None:
+        """장 마감 후 1회: 전략별 일별 수익률/승률/Sharpe/MDD 계산 → daily_performance upsert."""
+        today = date.today()
+        with Session(self.engine) as session:
+            running = session.query(Strategy).filter(Strategy.status == "running").all()
+            for strategy in running:
+                try:
+                    client = TradingClient(strategy.alpaca_key, strategy.alpaca_secret, paper=True)
+                    equity = float(client.get_account().equity)
+
+                    prev = (session.query(DailyPerformance)
+                            .filter(DailyPerformance.strategy_id == strategy.id,
+                                    DailyPerformance.date < today)
+                            .order_by(DailyPerformance.date.desc()).first())
+                    prev_value = float(prev.total_value) if prev else float(strategy.budget)
+                    daily_return = (equity - prev_value) / prev_value if prev_value else 0.0
+
+                    # Sharpe: 과거 일별 수익률 + 오늘치 (>=2개일 때만), 연율화(√252)
+                    returns = [float(r.daily_return) for r in
+                               session.query(DailyPerformance)
+                               .filter(DailyPerformance.strategy_id == strategy.id,
+                                       DailyPerformance.date < today).all()]
+                    returns.append(daily_return)
+                    sharpe = None
+                    if len(returns) >= 2:
+                        sd = statistics.pstdev(returns)
+                        sharpe = (statistics.mean(returns) / sd * (252 ** 0.5)) if sd else None
+
+                    # MDD: portfolio_history equity 고점 대비 현재 낙폭
+                    equities = [float(p.equity) for p in
+                                session.query(PortfolioHistory)
+                                .filter(PortfolioHistory.strategy_id == strategy.id).all()]
+                    equities.append(equity)
+                    peak = max(equities)
+                    drawdown = (peak - equity) / peak if peak else 0.0
+
+                    win_rate = self._compute_win_rate(session, strategy.id)
+
+                    row = (session.query(DailyPerformance)
+                           .filter_by(strategy_id=strategy.id, date=today).first())
+                    if row is None:
+                        row = DailyPerformance(strategy_id=strategy.id, date=today)
+                        session.add(row)
+                    row.total_value = equity
+                    row.daily_return = daily_return
+                    row.win_rate = win_rate
+                    row.sharpe_ratio = sharpe
+                    row.drawdown = drawdown
+                except Exception:
+                    logger.exception(f"daily_performance failed for strategy {strategy.id}")
+            session.commit()
+
+    def _compute_win_rate(self, session: Session, strategy_id: int):
+        """체결 내역을 종목별 FIFO로 매칭해 실현 승률 계산 (청산이 없으면 None)."""
+        trades = (session.query(Trade)
+                  .filter(Trade.strategy_id == strategy_id)
+                  .order_by(Trade.filled_at).all())
+        lots: dict[str, deque] = defaultdict(deque)  # symbol -> [ [qty, price], ... ] (매수 잔량)
+        wins = total = 0
+        for t in trades:
+            qty, price = float(t.qty), float(t.price)
+            if t.side == "buy":
+                lots[t.symbol].append([qty, price])
+            else:  # 매도 → FIFO 매수와 매칭해 실현
+                remaining = qty
+                while remaining > 1e-9 and lots[t.symbol]:
+                    lot = lots[t.symbol][0]
+                    take = min(remaining, lot[0])
+                    total += 1
+                    if price > lot[1]:
+                        wins += 1
+                    lot[0] -= take
+                    remaining -= take
+                    if lot[0] <= 1e-9:
+                        lots[t.symbol].popleft()
+        return (wins / total) if total else None
 ```
 
 - [ ] **Step 4: 테스트 실행 (통과 확인)**
@@ -967,13 +1195,13 @@ class StrategyManager:
 python -m pytest tests/test_manager.py -v
 ```
 
-Expected: `5 passed`
+Expected: `8 passed`
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add manager/manager.py tests/test_manager.py
-git commit -m "Feat: add StrategyManager with lifespan-compatible start/stop"
+git commit -m "Feat: add StrategyManager (lock, restart-count, idempotency, daily_performance)"
 ```
 
 ---
@@ -1141,10 +1369,12 @@ class DailyPerformanceResponse(BaseModel):
 - [ ] **Step 4: api/main.py 작성**
 
 ```python
+import os
 from contextlib import asynccontextmanager
 from typing import List
 
 from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
@@ -1167,6 +1397,17 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Trading Bot API", lifespan=lifespan)
+
+# 기존 웹 프론트엔드가 브라우저에서 호출 → CORS 허용 필수 (미설정 시 전부 차단)
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 _engine: Engine | None = None
 
 
