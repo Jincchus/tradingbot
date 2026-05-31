@@ -44,7 +44,7 @@ class StrategyManager:
         self.scheduler.shutdown(wait=False)
         with self._lock:
             for info in self.processes.values():
-                info["process"].terminate()
+                self._terminate_process(info["process"])
 
     def start_strategy(self, strategy_id: int) -> None:
         with self._lock:
@@ -67,8 +67,21 @@ class StrategyManager:
                 strategy.status = "stopped"
                 session.commit()
             if strategy_id in self.processes:
-                self.processes[strategy_id]["process"].terminate()
+                self._terminate_process(self.processes[strategy_id]["process"])
                 del self.processes[strategy_id]
+
+    def _terminate_process(self, proc) -> None:
+        """SIGTERM → 5s 대기 → 미종료 시 SIGKILL. join으로 좀비(defunct) reap.
+
+        전략 프로세스는 alpaca asyncio 웹소켓 루프가 SIGTERM을 즉시 처리하지 못해
+        terminate()만으로는 종료가 보장되지 않으므로 SIGKILL 폴백이 필요하다.
+        """
+        proc.terminate()
+        proc.join(timeout=5)
+        if proc.is_alive():
+            logger.warning(f"pid={proc.pid} did not stop on SIGTERM, sending SIGKILL")
+            proc.kill()
+            proc.join(timeout=3)
 
     def _launch_process(self, strategy: Strategy, restart_count: int = 0) -> None:
         # 항상 _lock 하에서 호출됨 (start/start_strategy/_monitor_crashes)

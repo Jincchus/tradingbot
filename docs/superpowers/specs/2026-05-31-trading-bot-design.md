@@ -147,6 +147,8 @@ POST /strategies/{id}/stop            Manager.stop_strategy() 직접 호출
 
 - 자식 프로세스(전략)는 `run()` 진입 후 독립적으로 DB Engine/Session/클라이언트 생성 (부모 객체 fork 공유 금지)
 - 프로세스 crash → `_monitor_crashes()`가 최대 3회 재시작, 초과 시 status=failed (재시작 카운터 보존 필수)
+- 프로세스 종료(stop) → SIGTERM 후 5s 대기, 미종료 시 SIGKILL + join (alpaca asyncio 웹소켓 루프가 SIGTERM을 즉시 처리하지 못해 terminate만으로는 종료/좀비 reap이 안 됨)
+- **데이터 연결 한도(실측)**: 무료 데이터 플랜은 같은 Alpaca 로그인 산하 전체에서 실시간 시세 웹소켓 **동시 1개**만 허용. 여러 전략을 독립 데이터 연결로 동시 실행하려면 → 데이터 플랜 업그레이드 / 시세 1개 연결 후 전략에 팬아웃 / 전략별 별도 로그인 중 택일 (10장 참조)
 - Alpaca WebSocket 연결 끊김 → alpaca-py 내장 재연결 로직 (지수 백오프)
 - `on_bar` 핸들러 내부 예외는 try/except로 격리 (한 bar 처리 오류가 스트림 전체를 죽이지 않도록)
 - `record_portfolio_history`/`record_daily_performance`는 전략별 try/except로 격리

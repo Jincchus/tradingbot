@@ -92,6 +92,20 @@ def test_record_portfolio_history_saves_to_db(manager, running_strategy, db_engi
         assert len(records) == 1
         assert float(records[0].equity) == 10500.00
 
+def test_terminate_process_sigkill_when_alive(manager):
+    proc = MagicMock()
+    proc.is_alive.return_value = True  # SIGTERM 후에도 살아있는 상황
+    manager._terminate_process(proc)
+    proc.terminate.assert_called_once()
+    proc.kill.assert_called_once()  # SIGKILL 폴백 호출돼야 함
+
+def test_terminate_process_no_sigkill_when_dead(manager):
+    proc = MagicMock()
+    proc.is_alive.return_value = False  # SIGTERM으로 정상 종료
+    manager._terminate_process(proc)
+    proc.terminate.assert_called_once()
+    proc.kill.assert_not_called()
+
 def test_start_strategy_idempotent_when_alive(manager, running_strategy, db_engine):
     alive_proc = MagicMock()
     alive_proc.is_alive.return_value = True
