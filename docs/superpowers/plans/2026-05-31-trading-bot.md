@@ -1519,8 +1519,8 @@ Expected: 전체 테스트 통과
 
 ```bash
 cp .env.example .env
-# .env 파일에 실제 DB 연결 정보 입력 후:
-python db/init_db.py
+# .env 파일에 실제 DB 연결 정보 입력 후 (패키지 임포트를 위해 -m 모듈 형태로 실행):
+python -m db.init_db
 ```
 
 Expected: `Tables created.`
