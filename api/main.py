@@ -7,10 +7,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
+from alpaca.trading.client import TradingClient
 from db.database import create_engine_for_process
 from db.models import Strategy, Trade, PortfolioHistory, DailyPerformance
 from api.schemas import (StrategyResponse, TradeResponse,
-                         PortfolioHistoryResponse, DailyPerformanceResponse)
+                         PortfolioHistoryResponse, DailyPerformanceResponse,
+                         PositionResponse)
 from manager.manager import StrategyManager
 
 _manager: StrategyManager | None = None
@@ -85,6 +87,31 @@ def get_trades(id: int, engine: Engine = Depends(get_engine)):
         return (session.query(Trade)
                 .filter(Trade.strategy_id == id)
                 .order_by(Trade.filled_at.desc()).all())
+
+
+@app.get("/strategies/{id}/positions", response_model=List[PositionResponse])
+def get_positions(id: int, engine: Engine = Depends(get_engine)):
+    with Session(engine) as session:
+        strategy = session.get(Strategy, id)
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Strategy not found")
+        key, secret = strategy.alpaca_key, strategy.alpaca_secret
+    try:
+        client = TradingClient(key, secret, paper=True)
+        positions = client.get_all_positions()
+    except Exception:
+        raise HTTPException(status_code=502, detail="Alpaca positions fetch failed")
+    return [
+        PositionResponse(
+            symbol=p.symbol,
+            qty=p.qty,
+            avg_entry_price=p.avg_entry_price,
+            current_price=getattr(p, "current_price", None),
+            unrealized_pl=p.unrealized_pl,
+            unrealized_plpc=p.unrealized_plpc,
+        )
+        for p in positions
+    ]
 
 
 @app.post("/strategies/{id}/start")

@@ -48,3 +48,14 @@ class DailyPerformanceResponse(BaseModel):
     drawdown: Optional[Decimal]
 
     model_config = {"from_attributes": True}
+
+
+class PositionResponse(BaseModel):
+    symbol: str
+    qty: Decimal
+    avg_entry_price: Decimal
+    current_price: Optional[Decimal]
+    unrealized_pl: Decimal
+    unrealized_plpc: Decimal
+
+    model_config = {"from_attributes": True}

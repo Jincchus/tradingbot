@@ -93,3 +93,28 @@ def test_stop_strategy_calls_manager(client, seeded_db, mock_mgr):
     resp = client.post("/strategies/1/stop")
     assert resp.status_code == 200
     mock_mgr.stop_strategy.assert_called_once_with(1)
+
+def test_get_positions_returns_list(client, seeded_db):
+    mock_pos = MagicMock()
+    mock_pos.symbol = "AAPL"
+    mock_pos.qty = "10"
+    mock_pos.avg_entry_price = "182.50"
+    mock_pos.current_price = "190.00"
+    mock_pos.unrealized_pl = "75.00"
+    mock_pos.unrealized_plpc = "0.0411"
+
+    with patch("api.main.TradingClient") as mock_cls:
+        mock_cls.return_value.get_all_positions.return_value = [mock_pos]
+        resp = client.get("/strategies/1/positions")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["symbol"] == "AAPL"
+    # Pydantic v2 serializes Decimal at input precision as a string ("10"->"10", "75.00"->"75.00")
+    assert data[0]["qty"] == "10"
+    assert data[0]["unrealized_pl"] == "75.00"
+
+def test_get_positions_strategy_not_found(client, seeded_db):
+    resp = client.get("/strategies/999/positions")
+    assert resp.status_code == 404
