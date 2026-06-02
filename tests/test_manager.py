@@ -170,3 +170,19 @@ def test_record_daily_performance_saves_to_db(manager, running_strategy, db_engi
         assert float(rows[0].total_value) == 10200.00
         # 첫날: 예산(10000) 대비 (10200-10000)/10000 = 0.02
         assert abs(float(rows[0].daily_return) - 0.02) < 1e-6
+
+def test_launch_process_uses_db_watchlist(manager, running_strategy, db_engine):
+    from sqlalchemy.orm import Session
+    from db.watchlist import replace_watchlist
+    with Session(db_engine) as session:
+        replace_watchlist(session, ["TSLA", "AMD"])
+        session.commit()
+
+    with patch("manager.manager.multiprocessing.Process"), \
+         patch.object(manager, "engine", db_engine):
+        with Session(db_engine) as session:
+            st = session.get(Strategy, 1)
+            manager._launch_process(st)
+
+    _sid, symbols, _q = manager.hub.add_strategy.call_args[0]
+    assert symbols == ["TSLA", "AMD"]

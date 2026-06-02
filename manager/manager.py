@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from db.database import create_engine_for_process
 from db.models import Strategy, Trade, PortfolioHistory, DailyPerformance
+from db.watchlist import get_watchlist_symbols
 from manager.market_data_hub import MarketDataHub
 
 logger = logging.getLogger("manager")
@@ -108,6 +109,8 @@ class StrategyManager:
     def _launch_process(self, strategy: Strategy, restart_count: int = 0) -> None:
         # 항상 _lock 하에서 호출됨 (start/start_strategy/_monitor_crashes)
         cls = self._load_strategy_class(strategy.strategy_type)
+        with Session(self.engine) as session:
+            symbols = get_watchlist_symbols(session)
         bar_queue = multiprocessing.Queue()
         instance = cls(
             strategy_id=strategy.id,
@@ -117,6 +120,8 @@ class StrategyManager:
             budget=float(strategy.budget),
             run_interval=strategy.run_interval,
             bar_queue=bar_queue,
+            symbols=symbols,
+            position_size=float(strategy.position_size),
         )
         # select_symbols는 매니저 프로세스에서도 호출되므로 무거운 자원에 의존하면 안 됨
         symbols = instance.select_symbols()
