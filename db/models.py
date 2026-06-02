@@ -24,6 +24,14 @@ class Strategy(Base):
     daily_performance: Mapped[list["DailyPerformance"]] = relationship(back_populates="strategy")
 
 
+class Watchlist(Base):
+    __tablename__ = "watchlist"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class Trade(Base):
     __tablename__ = "trades"
 
