@@ -11,6 +11,7 @@ class StrategyResponse(BaseModel):
     budget: Decimal
     status: str
     run_interval: str
+    position_size: Decimal
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -59,3 +60,15 @@ class PositionResponse(BaseModel):
     unrealized_plpc: Decimal
 
     model_config = {"from_attributes": True}
+
+
+class WatchlistResponse(BaseModel):
+    symbols: list[str]
+
+
+class WatchlistUpdate(BaseModel):
+    symbols: list[str]
+
+
+class StrategyUpdate(BaseModel):
+    position_size: Optional[Decimal] = None
