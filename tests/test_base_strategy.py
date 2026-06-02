@@ -122,3 +122,41 @@ def test_get_metrics_returns_account_info(concrete_strategy):
 
     assert metrics["equity"] == 10500.00
     assert metrics["cash"] == 5000.00
+
+
+def test_injected_symbols_and_position_size_used():
+    from unittest.mock import patch
+    from sqlalchemy import create_engine
+    from db.database import Base
+    from strategies.ma_crossover import MACrossoverStrategy
+    e = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(e)
+    with patch("strategies.base.TradingClient"), \
+         patch("strategies.base.TradingStream"), \
+         patch("strategies.base.create_engine_for_process", return_value=e):
+        s = MACrossoverStrategy(
+            strategy_id=1, name="t", api_key="k", api_secret="s",
+            budget=10000.0, run_interval="1m",
+            symbols=["TSLA", "AMD"], position_size=0.1,
+        )
+    assert s.select_symbols() == ["TSLA", "AMD"]
+    assert s.position_size == 0.1
+
+
+def test_missing_symbols_falls_back_to_default():
+    from unittest.mock import patch
+    from sqlalchemy import create_engine
+    from db.database import Base
+    from db.watchlist import DEFAULT_WATCHLIST
+    from strategies.ma_crossover import MACrossoverStrategy
+    e = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(e)
+    with patch("strategies.base.TradingClient"), \
+         patch("strategies.base.TradingStream"), \
+         patch("strategies.base.create_engine_for_process", return_value=e):
+        s = MACrossoverStrategy(
+            strategy_id=1, name="t", api_key="k", api_secret="s",
+            budget=10000.0, run_interval="1m",
+        )
+    assert s.select_symbols() == DEFAULT_WATCHLIST
+    assert s.position_size == 0.2

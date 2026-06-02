@@ -11,7 +11,7 @@ class MACrossoverStrategy(BaseStrategy):
     POSITION_SIZE = 0.2
 
     def select_symbols(self) -> list[str]:
-        return self.WATCHLIST
+        return self.symbols
 
     def on_bar(self, bar) -> None:
         symbol = bar.symbol
