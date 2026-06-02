@@ -186,3 +186,32 @@ def test_launch_process_uses_db_watchlist(manager, running_strategy, db_engine):
 
     _sid, symbols, _q = manager.hub.add_strategy.call_args[0]
     assert symbols == ["TSLA", "AMD"]
+
+def test_liquidate_strategy_stops_and_closes_symbol(manager, running_strategy, db_engine):
+    mock_proc = MagicMock()
+    manager.processes[1] = {"process": mock_proc, "restart_count": 0, "queue": MagicMock()}
+
+    with patch("manager.manager.TradingClient") as mock_cls, \
+         patch.object(manager, "engine", db_engine):
+        manager.liquidate_strategy(1, symbol="AAPL")
+
+    mock_cls.return_value.close_position.assert_called_once_with("AAPL")
+    mock_proc.terminate.assert_called_once()  # 봇 멈춤
+    with Session(db_engine) as session:
+        assert session.get(Strategy, 1).status == "stopped"
+
+
+def test_liquidate_strategy_closes_all_when_no_symbol(manager, running_strategy, db_engine):
+    with patch("manager.manager.TradingClient") as mock_cls, \
+         patch.object(manager, "engine", db_engine):
+        manager.liquidate_strategy(1)
+
+    mock_cls.return_value.close_all_positions.assert_called_once_with(cancel_orders=True)
+
+
+def test_liquidate_all_liquidates_running(manager, running_strategy, db_engine):
+    with patch.object(manager, "liquidate_strategy") as mock_liq, \
+         patch.object(manager, "engine", db_engine):
+        manager.liquidate_all()
+
+    mock_liq.assert_called_once_with(1)

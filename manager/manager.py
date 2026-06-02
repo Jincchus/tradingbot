@@ -145,6 +145,39 @@ class StrategyManager:
                 return cls
         raise ValueError(f"No BaseStrategy subclass in strategies/{strategy_type}.py")
 
+    def _make_client(self, strategy) -> TradingClient:
+        return TradingClient(strategy.alpaca_key, strategy.alpaca_secret, paper=True)
+
+    def liquidate_strategy(self, strategy_id: int, symbol: str | None = None) -> None:
+        """비상 청산: 봇을 멈추고(stopped) 포지션을 판다. symbol=None이면 전체 청산.
+
+        봇이 켜진 채 강제 매도하면 포지션 캐시가 어긋나므로 항상 먼저 멈춘다.
+        청산은 봇 프로세스가 아니라 매니저가 직접 주문 → 봇이 죽어있어도 작동.
+        """
+        with self._lock, Session(self.engine) as session:
+            strategy = session.get(Strategy, strategy_id)
+            if strategy is None:
+                return
+            strategy.status = "stopped"
+            session.commit()
+            self._teardown_process(strategy_id)
+            try:
+                client = self._make_client(strategy)
+                if symbol is None:
+                    client.close_all_positions(cancel_orders=True)
+                else:
+                    client.close_position(symbol)
+            except Exception:
+                logger.exception(f"liquidate failed strategy={strategy_id} symbol={symbol}")
+
+    def liquidate_all(self) -> None:
+        """폭락 비상 버튼: running 전략을 모두 청산 + 정지."""
+        with self._lock, Session(self.engine) as session:
+            ids = [s.id for s in session.query(Strategy)
+                   .filter(Strategy.status == "running").all()]
+        for sid in ids:
+            self.liquidate_strategy(sid)
+
     def _monitor_crashes(self) -> None:
         with self._lock, Session(self.engine) as session:
             for strategy_id, info in list(self.processes.items()):
