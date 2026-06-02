@@ -7,11 +7,6 @@ from strategies.base import BaseStrategy
 class MACrossoverStrategy(BaseStrategy):
     SHORT_WINDOW = 10
     LONG_WINDOW = 30
-    WATCHLIST = ["AAPL", "MSFT", "NVDA", "TSLA", "GOOGL"]
-    POSITION_SIZE = 0.2
-
-    def select_symbols(self) -> list[str]:
-        return self.WATCHLIST
 
     def on_bar(self, bar) -> None:
         symbol = bar.symbol
@@ -33,7 +28,7 @@ class MACrossoverStrategy(BaseStrategy):
         has_position = symbol in self._positions
 
         if is_golden_cross and not has_position:
-            qty = int(self.budget * self.POSITION_SIZE / float(bar.close))
+            qty = int(self.budget * self.position_size / float(bar.close))
             if qty > 0:
                 self.trading_client.submit_order(
                     MarketOrderRequest(

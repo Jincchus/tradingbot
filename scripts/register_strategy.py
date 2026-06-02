@@ -23,6 +23,8 @@ def main() -> None:
     parser.add_argument("--type", required=True, help="strategies/<type>.py 파일명")
     parser.add_argument("--budget", type=Decimal, default=Decimal("10000"))
     parser.add_argument("--interval", default="1m", help="1m / 5m / 15m / 1h / 1d")
+    parser.add_argument("--position-size", type=Decimal, default=Decimal("0.2"),
+                        help="종목당 예산 비중 (0~1, 기본 0.2)")
     args = parser.parse_args()
 
     try:
@@ -41,6 +43,7 @@ def main() -> None:
             budget=args.budget,
             status="stopped",
             run_interval=args.interval,
+            position_size=args.position_size,
         )
         session.add(strategy)
         session.commit()

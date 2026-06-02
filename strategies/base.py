@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from db.database import create_engine_for_process
 from db.models import Trade
+from db.watchlist import DEFAULT_WATCHLIST
 
 
 def timeframe_for(run_interval: str) -> TimeFrame:
@@ -36,7 +37,8 @@ class BaseStrategy(abc.ABC):
     BUFFER_SIZE = 200
 
     def __init__(self, strategy_id: int, name: str, api_key: str, api_secret: str,
-                 budget: float, run_interval: str, bar_queue=None):
+                 budget: float, run_interval: str, bar_queue=None,
+                 symbols=None, position_size=None):
         self.strategy_id = strategy_id
         self.name = name
         self.api_key = api_key
@@ -45,6 +47,9 @@ class BaseStrategy(abc.ABC):
         self.run_interval = run_interval
         # 시세는 MarketDataHub(중앙 1연결)가 이 큐로 분배한다. 전략은 자체 시세 연결을 열지 않음.
         self.bar_queue = bar_queue
+        # 감시 종목/포지션 크기는 매니저가 DB에서 읽어 주입. 미주입 시 안전 폴백.
+        self.symbols = list(symbols) if symbols else list(DEFAULT_WATCHLIST)
+        self.position_size = position_size if position_size else 0.2
         self.logger = logging.getLogger(name)
         # 무거운 자원은 run()/_setup()에서 생성 (fork된 자식 프로세스에서만)
         self.trading_client: TradingClient | None = None
@@ -85,9 +90,8 @@ class BaseStrategy(abc.ABC):
             self._bar_buffer[symbol] = deque(df["close"].tolist(), maxlen=self.BUFFER_SIZE)
             self.logger.info(f"Prefetched {len(self._bar_buffer[symbol])} bars for {symbol}")
 
-    @abc.abstractmethod
     def select_symbols(self) -> list[str]:
-        ...
+        return self.symbols
 
     @abc.abstractmethod
     def on_bar(self, bar) -> None:

@@ -1,5 +1,7 @@
 import os
 os.environ.setdefault("BOT_API_TOKEN", "")  # disable token auth in tests
+os.environ.setdefault("ALPACA_KEY", "test")
+os.environ.setdefault("ALPACA_SECRET", "test")
 
 import pytest
 from unittest.mock import MagicMock, patch
@@ -121,3 +123,80 @@ def test_get_positions_returns_list(client, seeded_db):
 def test_get_positions_strategy_not_found(client, seeded_db):
     resp = client.get("/strategies/999/positions")
     assert resp.status_code == 404
+
+
+def test_get_watchlist_returns_default_when_empty(client, seeded_db):
+    resp = client.get("/watchlist")
+    assert resp.status_code == 200
+    assert resp.json()["symbols"] == ["AAPL", "MSFT", "NVDA", "TSLA", "GOOGL"]
+
+
+def test_put_watchlist_validates_and_applies(client, seeded_db, mock_mgr):
+    with patch("api.main.TradingClient") as mock_cls:
+        asset = MagicMock()
+        asset.tradable = True
+        asset.status.value = "active"
+        mock_cls.return_value.get_asset.return_value = asset
+        resp = client.put("/watchlist", json={"symbols": ["tsla", "amd"]})
+
+    assert resp.status_code == 200
+    assert resp.json()["symbols"] == ["TSLA", "AMD"]
+    mock_mgr.apply_watchlist.assert_called_once_with(["TSLA", "AMD"])
+
+
+def test_put_watchlist_rejects_invalid_symbol(client, seeded_db, mock_mgr):
+    with patch("api.main.TradingClient") as mock_cls:
+        asset = MagicMock()
+        asset.tradable = False
+        asset.status.value = "inactive"
+        mock_cls.return_value.get_asset.return_value = asset
+        resp = client.put("/watchlist", json={"symbols": ["BADX"]})
+
+    assert resp.status_code == 400
+    mock_mgr.apply_watchlist.assert_not_called()
+
+
+def test_put_watchlist_rejects_empty(client, seeded_db, mock_mgr):
+    resp = client.put("/watchlist", json={"symbols": []})
+    assert resp.status_code == 400
+    mock_mgr.apply_watchlist.assert_not_called()
+
+
+def test_patch_strategy_updates_position_size(client, seeded_db):
+    resp = client.patch("/strategies/1", json={"position_size": 0.1})
+    assert resp.status_code == 200
+    assert float(resp.json()["position_size"]) == 0.1
+
+
+def test_patch_strategy_rejects_out_of_range(client, seeded_db):
+    resp = client.patch("/strategies/1", json={"position_size": 1.5})
+    assert resp.status_code == 400
+
+
+def test_patch_strategy_not_found(client, seeded_db):
+    resp = client.patch("/strategies/999", json={"position_size": 0.1})
+    assert resp.status_code == 404
+
+
+def test_close_one_position_calls_manager(client, seeded_db, mock_mgr):
+    resp = client.post("/strategies/1/positions/aapl/close")
+    assert resp.status_code == 200
+    mock_mgr.liquidate_strategy.assert_called_once_with(1, symbol="AAPL")
+
+
+def test_liquidate_strategy_calls_manager(client, seeded_db, mock_mgr):
+    resp = client.post("/strategies/1/liquidate")
+    assert resp.status_code == 200
+    mock_mgr.liquidate_strategy.assert_called_once_with(1)
+
+
+def test_liquidate_all_calls_manager(client, seeded_db, mock_mgr):
+    resp = client.post("/liquidate-all")
+    assert resp.status_code == 200
+    mock_mgr.liquidate_all.assert_called_once_with()
+
+
+def test_close_one_position_strategy_not_found(client, seeded_db, mock_mgr):
+    resp = client.post("/strategies/999/positions/AAPL/close")
+    assert resp.status_code == 404
+    mock_mgr.liquidate_strategy.assert_not_called()

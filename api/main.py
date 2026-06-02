@@ -12,7 +12,9 @@ from db.database import create_engine_for_process
 from db.models import Strategy, Trade, PortfolioHistory, DailyPerformance
 from api.schemas import (StrategyResponse, TradeResponse,
                          PortfolioHistoryResponse, DailyPerformanceResponse,
-                         PositionResponse)
+                         PositionResponse, WatchlistResponse, WatchlistUpdate,
+                         StrategyUpdate)
+from db.watchlist import get_watchlist_symbols
 from manager.manager import StrategyManager
 
 # Token authentication
@@ -68,6 +70,21 @@ def get_manager() -> StrategyManager:
 def list_strategies(engine: Engine = Depends(get_engine)):
     with Session(engine) as session:
         return session.query(Strategy).all()
+
+
+@app.patch("/strategies/{id}", response_model=StrategyResponse, dependencies=[Depends(require_token)])
+def update_strategy(id: int, body: StrategyUpdate, engine: Engine = Depends(get_engine)):
+    with Session(engine) as session:
+        strategy = session.get(Strategy, id)
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Strategy not found")
+        if body.position_size is not None:
+            if not (0 < body.position_size <= 1):
+                raise HTTPException(status_code=400, detail="position_size must be in (0, 1]")
+            strategy.position_size = body.position_size
+        session.commit()
+        session.refresh(strategy)
+        return strategy
 
 
 @app.get("/strategies/{id}/performance", response_model=List[DailyPerformanceResponse], dependencies=[Depends(require_token)])
@@ -143,3 +160,66 @@ def stop_strategy(id: int, engine: Engine = Depends(get_engine),
             raise HTTPException(status_code=404, detail="Strategy not found")
     mgr.stop_strategy(id)
     return {"message": "stopped"}
+
+
+def validate_symbols(symbols: list[str]) -> list[str]:
+    """거래 불가/존재하지 않는 종목 목록을 돌려준다(빈 리스트=모두 정상)."""
+    key = os.getenv("ALPACA_KEY", "")
+    secret = os.getenv("ALPACA_SECRET", "")
+    if not key or not secret:
+        raise HTTPException(status_code=503, detail="ALPACA_KEY not configured for validation")
+    client = TradingClient(key, secret, paper=True)
+    invalid: list[str] = []
+    for sym in symbols:
+        try:
+            asset = client.get_asset(sym)
+            if not (asset.tradable and asset.status.value == "active"):
+                invalid.append(sym)
+        except Exception:
+            invalid.append(sym)
+    return invalid
+
+
+@app.get("/watchlist", response_model=WatchlistResponse, dependencies=[Depends(require_token)])
+def get_watchlist(engine: Engine = Depends(get_engine)):
+    with Session(engine) as session:
+        return WatchlistResponse(symbols=get_watchlist_symbols(session))
+
+
+@app.put("/watchlist", response_model=WatchlistResponse, dependencies=[Depends(require_token)])
+def update_watchlist(body: WatchlistUpdate,
+                     mgr: StrategyManager = Depends(get_manager)):
+    symbols = [s.strip().upper() for s in body.symbols if s.strip()]
+    if not symbols:
+        raise HTTPException(status_code=400, detail="watchlist must contain at least one symbol")
+    invalid = validate_symbols(symbols)
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"invalid or non-tradable symbols: {invalid}")
+    mgr.apply_watchlist(symbols)
+    return WatchlistResponse(symbols=symbols)
+
+
+@app.post("/strategies/{id}/positions/{symbol}/close", dependencies=[Depends(require_token)])
+def close_position(id: int, symbol: str, engine: Engine = Depends(get_engine),
+                   mgr: StrategyManager = Depends(get_manager)):
+    with Session(engine) as session:
+        if not session.get(Strategy, id):
+            raise HTTPException(status_code=404, detail="Strategy not found")
+    mgr.liquidate_strategy(id, symbol=symbol.upper())
+    return {"message": "closed", "symbol": symbol.upper()}
+
+
+@app.post("/strategies/{id}/liquidate", dependencies=[Depends(require_token)])
+def liquidate_strategy(id: int, engine: Engine = Depends(get_engine),
+                       mgr: StrategyManager = Depends(get_manager)):
+    with Session(engine) as session:
+        if not session.get(Strategy, id):
+            raise HTTPException(status_code=404, detail="Strategy not found")
+    mgr.liquidate_strategy(id)
+    return {"message": "liquidated"}
+
+
+@app.post("/liquidate-all", dependencies=[Depends(require_token)])
+def liquidate_all(mgr: StrategyManager = Depends(get_manager)):
+    mgr.liquidate_all()
+    return {"message": "all liquidated"}

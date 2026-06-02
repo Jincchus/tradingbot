@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from db.database import create_engine_for_process
 from db.models import Strategy, Trade, PortfolioHistory, DailyPerformance
+from db.watchlist import get_watchlist_symbols, replace_watchlist
 from manager.market_data_hub import MarketDataHub
 
 logger = logging.getLogger("manager")
@@ -108,6 +109,8 @@ class StrategyManager:
     def _launch_process(self, strategy: Strategy, restart_count: int = 0) -> None:
         # 항상 _lock 하에서 호출됨 (start/start_strategy/_monitor_crashes)
         cls = self._load_strategy_class(strategy.strategy_type)
+        with Session(self.engine) as session:
+            symbols = get_watchlist_symbols(session)
         bar_queue = multiprocessing.Queue()
         instance = cls(
             strategy_id=strategy.id,
@@ -117,6 +120,8 @@ class StrategyManager:
             budget=float(strategy.budget),
             run_interval=strategy.run_interval,
             bar_queue=bar_queue,
+            symbols=symbols,
+            position_size=float(strategy.position_size),
         )
         # select_symbols는 매니저 프로세스에서도 호출되므로 무거운 자원에 의존하면 안 됨
         symbols = instance.select_symbols()
@@ -139,6 +144,80 @@ class StrategyManager:
             if issubclass(cls, BaseStrategy) and cls is not BaseStrategy:
                 return cls
         raise ValueError(f"No BaseStrategy subclass in strategies/{strategy_type}.py")
+
+    def _make_client(self, strategy) -> TradingClient:
+        return TradingClient(strategy.alpaca_key, strategy.alpaca_secret, paper=True)
+
+    def liquidate_strategy(self, strategy_id: int, symbol: str | None = None) -> None:
+        """비상 청산: 봇을 멈추고(stopped) 포지션을 판다. symbol=None이면 전체 청산.
+
+        봇이 켜진 채 강제 매도하면 포지션 캐시가 어긋나므로 항상 먼저 멈춘다.
+        청산은 봇 프로세스가 아니라 매니저가 직접 주문 → 봇이 죽어있어도 작동.
+        """
+        with self._lock, Session(self.engine) as session:
+            strategy = session.get(Strategy, strategy_id)
+            if strategy is None:
+                return
+            strategy.status = "stopped"
+            session.commit()
+            self._teardown_process(strategy_id)
+            try:
+                client = self._make_client(strategy)
+                if symbol is None:
+                    client.close_all_positions(cancel_orders=True)
+                else:
+                    client.close_position(symbol)
+            except Exception:
+                logger.exception(f"liquidate failed strategy={strategy_id} symbol={symbol}")
+
+    def liquidate_all(self) -> None:
+        """폭락 비상 버튼: running 전략을 모두 청산 + 정지."""
+        with self._lock, Session(self.engine) as session:
+            ids = [s.id for s in session.query(Strategy)
+                   .filter(Strategy.status == "running").all()]
+        for sid in ids:
+            self.liquidate_strategy(sid)
+
+    def apply_watchlist(self, symbols: list[str]) -> None:
+        """검증 통과한 새 종목 목록 적용: 돌던 봇 정지 → 빠진 종목 청산 → 저장 → 재시작.
+
+        호출 전 API가 알파카 검증을 끝낸 상태여야 한다.
+        """
+        with self._lock, Session(self.engine) as session:
+            removed = set(get_watchlist_symbols(session)) - set(symbols)
+            running_ids = [sid for sid, info in list(self.processes.items())
+                           if info["process"].is_alive()]
+
+            # 1) 돌던 봇 정지
+            for sid in running_ids:
+                st = session.get(Strategy, sid)
+                if st:
+                    st.status = "stopped"
+                self._teardown_process(sid)
+            session.commit()
+
+            # 2) 빠진 종목을 보유한 모든 전략에서 청산 (봇별 격리)
+            if removed:
+                for strategy in session.query(Strategy).all():
+                    try:
+                        client = self._make_client(strategy)
+                        held = {p.symbol for p in client.get_all_positions()}
+                        for sym in removed & held:
+                            client.close_position(sym)
+                    except Exception:
+                        logger.exception(f"watchlist liquidation failed strategy={strategy.id}")
+
+            # 3) 새 목록 저장
+            replace_watchlist(session, symbols)
+            session.commit()
+
+            # 4) 직전에 돌던 봇 재시작 (새 종목 반영)
+            for sid in running_ids:
+                st = session.get(Strategy, sid)
+                if st:
+                    st.status = "running"
+                    session.commit()
+                    self._launch_process(st)
 
     def _monitor_crashes(self) -> None:
         with self._lock, Session(self.engine) as session:

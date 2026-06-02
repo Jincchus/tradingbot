@@ -170,3 +170,85 @@ def test_record_daily_performance_saves_to_db(manager, running_strategy, db_engi
         assert float(rows[0].total_value) == 10200.00
         # 첫날: 예산(10000) 대비 (10200-10000)/10000 = 0.02
         assert abs(float(rows[0].daily_return) - 0.02) < 1e-6
+
+def test_launch_process_uses_db_watchlist(manager, running_strategy, db_engine):
+    from sqlalchemy.orm import Session
+    from db.watchlist import replace_watchlist
+    with Session(db_engine) as session:
+        replace_watchlist(session, ["TSLA", "AMD"])
+        session.commit()
+
+    with patch("manager.manager.multiprocessing.Process"), \
+         patch.object(manager, "engine", db_engine):
+        with Session(db_engine) as session:
+            st = session.get(Strategy, 1)
+            manager._launch_process(st)
+
+    _sid, symbols, _q = manager.hub.add_strategy.call_args[0]
+    assert symbols == ["TSLA", "AMD"]
+
+def test_liquidate_strategy_stops_and_closes_symbol(manager, running_strategy, db_engine):
+    mock_proc = MagicMock()
+    manager.processes[1] = {"process": mock_proc, "restart_count": 0, "queue": MagicMock()}
+
+    with patch("manager.manager.TradingClient") as mock_cls, \
+         patch.object(manager, "engine", db_engine):
+        manager.liquidate_strategy(1, symbol="AAPL")
+
+    mock_cls.return_value.close_position.assert_called_once_with("AAPL")
+    mock_proc.terminate.assert_called_once()  # 봇 멈춤
+    with Session(db_engine) as session:
+        assert session.get(Strategy, 1).status == "stopped"
+
+
+def test_liquidate_strategy_closes_all_when_no_symbol(manager, running_strategy, db_engine):
+    with patch("manager.manager.TradingClient") as mock_cls, \
+         patch.object(manager, "engine", db_engine):
+        manager.liquidate_strategy(1)
+
+    mock_cls.return_value.close_all_positions.assert_called_once_with(cancel_orders=True)
+
+
+def test_liquidate_all_liquidates_running(manager, running_strategy, db_engine):
+    with patch.object(manager, "liquidate_strategy") as mock_liq, \
+         patch.object(manager, "engine", db_engine):
+        manager.liquidate_all()
+
+    mock_liq.assert_called_once_with(1)
+
+
+def test_apply_watchlist_saves_and_restarts_running(manager, running_strategy, db_engine):
+    from db.watchlist import get_watchlist_symbols
+    alive = MagicMock()
+    alive.is_alive.return_value = True
+    manager.processes[1] = {"process": alive, "restart_count": 0, "queue": MagicMock()}
+
+    with patch.object(manager, "_teardown_process") as mock_teardown, \
+         patch.object(manager, "_launch_process") as mock_launch, \
+         patch("manager.manager.TradingClient"), \
+         patch.object(manager, "engine", db_engine):
+        manager.apply_watchlist(["TSLA", "AMD"])
+
+    with Session(db_engine) as session:
+        assert get_watchlist_symbols(session) == ["TSLA", "AMD"]
+    mock_teardown.assert_called_once_with(1)   # 돌던 봇 정지
+    mock_launch.assert_called_once()           # 새 종목으로 재시작
+
+
+def test_apply_watchlist_liquidates_removed_symbols(manager, running_strategy, db_engine):
+    from db.watchlist import replace_watchlist
+    with Session(db_engine) as session:
+        replace_watchlist(session, ["AAPL", "MSFT"])
+        session.commit()
+
+    held = MagicMock()
+    held.symbol = "AAPL"  # 봇이 AAPL 보유 중
+
+    with patch.object(manager, "_teardown_process"), \
+         patch.object(manager, "_launch_process"), \
+         patch("manager.manager.TradingClient") as mock_cls, \
+         patch.object(manager, "engine", db_engine):
+        mock_cls.return_value.get_all_positions.return_value = [held]
+        manager.apply_watchlist(["MSFT"])  # AAPL 제거
+
+    mock_cls.return_value.close_position.assert_called_once_with("AAPL")

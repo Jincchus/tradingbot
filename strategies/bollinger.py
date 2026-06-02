@@ -9,11 +9,6 @@ class BollingerStrategy(BaseStrategy):
 
     PERIOD = 20
     NUM_STD = 2
-    WATCHLIST = ["AAPL", "MSFT", "NVDA", "TSLA", "GOOGL"]
-    POSITION_SIZE = 0.2
-
-    def select_symbols(self) -> list[str]:
-        return self.WATCHLIST
 
     def on_bar(self, bar) -> None:
         symbol = bar.symbol
@@ -33,7 +28,7 @@ class BollingerStrategy(BaseStrategy):
         close = float(bar.close)
 
         if close <= lower_band and not has_position:
-            qty = int(self.budget * self.POSITION_SIZE / close)
+            qty = int(self.budget * self.position_size / close)
             if qty > 0:
                 self.trading_client.submit_order(
                     MarketOrderRequest(
