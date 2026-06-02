@@ -197,3 +197,29 @@ def update_watchlist(body: WatchlistUpdate,
         raise HTTPException(status_code=400, detail=f"invalid or non-tradable symbols: {invalid}")
     mgr.apply_watchlist(symbols)
     return WatchlistResponse(symbols=symbols)
+
+
+@app.post("/strategies/{id}/positions/{symbol}/close", dependencies=[Depends(require_token)])
+def close_position(id: int, symbol: str, engine: Engine = Depends(get_engine),
+                   mgr: StrategyManager = Depends(get_manager)):
+    with Session(engine) as session:
+        if not session.get(Strategy, id):
+            raise HTTPException(status_code=404, detail="Strategy not found")
+    mgr.liquidate_strategy(id, symbol=symbol.upper())
+    return {"message": "closed", "symbol": symbol.upper()}
+
+
+@app.post("/strategies/{id}/liquidate", dependencies=[Depends(require_token)])
+def liquidate_strategy(id: int, engine: Engine = Depends(get_engine),
+                       mgr: StrategyManager = Depends(get_manager)):
+    with Session(engine) as session:
+        if not session.get(Strategy, id):
+            raise HTTPException(status_code=404, detail="Strategy not found")
+    mgr.liquidate_strategy(id)
+    return {"message": "liquidated"}
+
+
+@app.post("/liquidate-all", dependencies=[Depends(require_token)])
+def liquidate_all(mgr: StrategyManager = Depends(get_manager)):
+    mgr.liquidate_all()
+    return {"message": "all liquidated"}

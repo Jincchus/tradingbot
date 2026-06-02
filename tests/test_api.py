@@ -176,3 +176,27 @@ def test_patch_strategy_rejects_out_of_range(client, seeded_db):
 def test_patch_strategy_not_found(client, seeded_db):
     resp = client.patch("/strategies/999", json={"position_size": 0.1})
     assert resp.status_code == 404
+
+
+def test_close_one_position_calls_manager(client, seeded_db, mock_mgr):
+    resp = client.post("/strategies/1/positions/aapl/close")
+    assert resp.status_code == 200
+    mock_mgr.liquidate_strategy.assert_called_once_with(1, symbol="AAPL")
+
+
+def test_liquidate_strategy_calls_manager(client, seeded_db, mock_mgr):
+    resp = client.post("/strategies/1/liquidate")
+    assert resp.status_code == 200
+    mock_mgr.liquidate_strategy.assert_called_once_with(1)
+
+
+def test_liquidate_all_calls_manager(client, seeded_db, mock_mgr):
+    resp = client.post("/liquidate-all")
+    assert resp.status_code == 200
+    mock_mgr.liquidate_all.assert_called_once_with()
+
+
+def test_close_one_position_strategy_not_found(client, seeded_db, mock_mgr):
+    resp = client.post("/strategies/999/positions/AAPL/close")
+    assert resp.status_code == 404
+    mock_mgr.liquidate_strategy.assert_not_called()
