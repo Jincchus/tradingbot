@@ -2,8 +2,9 @@
 
 각 전략은 독립된 Alpaca 페이퍼 계정에서 실행되며, 동일한 `BaseStrategy` 인터페이스(`select_symbols`, `on_bar`)를 구현한다. 모든 전략은 `_bar_buffer`(종목별 종가 롤링 버퍼)만으로 지표를 계산하므로 실시간 추가 API 호출이 없다.
 
-공통 감시 종목: `AAPL, MSFT, NVDA, TSLA, GOOGL`
-공통 포지션 크기: 예산의 20% (`POSITION_SIZE = 0.2`)
+공통 감시 종목: DB `watchlist` 표에서 관리 (비어있으면 기본 `AAPL, MSFT, NVDA, TSLA, GOOGL`). `GET`/`PUT /watchlist`로 조회·변경하며, 변경 시 빠진 종목은 자동 청산되고 돌던 봇은 자동 재시작된다.
+포지션 크기: 봇별 `strategies.position_size` (기본 0.2 = 예산의 20%). `PATCH /strategies/{id}`로 변경.
+비상 청산: `POST /strategies/{id}/positions/{symbol}/close`(종목 1개), `POST /strategies/{id}/liquidate`(봇 전체), `POST /liquidate-all`(전체) — 모두 해당 봇을 멈추고 매도한다.
 
 ---
 
