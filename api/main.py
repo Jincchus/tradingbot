@@ -72,6 +72,21 @@ def list_strategies(engine: Engine = Depends(get_engine)):
         return session.query(Strategy).all()
 
 
+@app.patch("/strategies/{id}", response_model=StrategyResponse, dependencies=[Depends(require_token)])
+def update_strategy(id: int, body: StrategyUpdate, engine: Engine = Depends(get_engine)):
+    with Session(engine) as session:
+        strategy = session.get(Strategy, id)
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Strategy not found")
+        if body.position_size is not None:
+            if not (0 < body.position_size <= 1):
+                raise HTTPException(status_code=400, detail="position_size must be in (0, 1]")
+            strategy.position_size = body.position_size
+        session.commit()
+        session.refresh(strategy)
+        return strategy
+
+
 @app.get("/strategies/{id}/performance", response_model=List[DailyPerformanceResponse], dependencies=[Depends(require_token)])
 def get_performance(id: int, engine: Engine = Depends(get_engine)):
     with Session(engine) as session:

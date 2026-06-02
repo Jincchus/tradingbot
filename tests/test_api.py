@@ -160,3 +160,19 @@ def test_put_watchlist_rejects_empty(client, seeded_db, mock_mgr):
     resp = client.put("/watchlist", json={"symbols": []})
     assert resp.status_code == 400
     mock_mgr.apply_watchlist.assert_not_called()
+
+
+def test_patch_strategy_updates_position_size(client, seeded_db):
+    resp = client.patch("/strategies/1", json={"position_size": 0.1})
+    assert resp.status_code == 200
+    assert float(resp.json()["position_size"]) == 0.1
+
+
+def test_patch_strategy_rejects_out_of_range(client, seeded_db):
+    resp = client.patch("/strategies/1", json={"position_size": 1.5})
+    assert resp.status_code == 400
+
+
+def test_patch_strategy_not_found(client, seeded_db):
+    resp = client.patch("/strategies/999", json={"position_size": 0.1})
+    assert resp.status_code == 404
