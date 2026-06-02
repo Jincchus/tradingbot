@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from db.database import create_engine_for_process
 from db.models import Strategy, Trade, PortfolioHistory, DailyPerformance
-from db.watchlist import get_watchlist_symbols
+from db.watchlist import get_watchlist_symbols, replace_watchlist
 from manager.market_data_hub import MarketDataHub
 
 logger = logging.getLogger("manager")
@@ -177,6 +177,47 @@ class StrategyManager:
                    .filter(Strategy.status == "running").all()]
         for sid in ids:
             self.liquidate_strategy(sid)
+
+    def apply_watchlist(self, symbols: list[str]) -> None:
+        """검증 통과한 새 종목 목록 적용: 돌던 봇 정지 → 빠진 종목 청산 → 저장 → 재시작.
+
+        호출 전 API가 알파카 검증을 끝낸 상태여야 한다.
+        """
+        with self._lock, Session(self.engine) as session:
+            removed = set(get_watchlist_symbols(session)) - set(symbols)
+            running_ids = [sid for sid, info in list(self.processes.items())
+                           if info["process"].is_alive()]
+
+            # 1) 돌던 봇 정지
+            for sid in running_ids:
+                st = session.get(Strategy, sid)
+                if st:
+                    st.status = "stopped"
+                self._teardown_process(sid)
+            session.commit()
+
+            # 2) 빠진 종목을 보유한 모든 전략에서 청산 (봇별 격리)
+            if removed:
+                for strategy in session.query(Strategy).all():
+                    try:
+                        client = self._make_client(strategy)
+                        held = {p.symbol for p in client.get_all_positions()}
+                        for sym in removed & held:
+                            client.close_position(sym)
+                    except Exception:
+                        logger.exception(f"watchlist liquidation failed strategy={strategy.id}")
+
+            # 3) 새 목록 저장
+            replace_watchlist(session, symbols)
+            session.commit()
+
+            # 4) 직전에 돌던 봇 재시작 (새 종목 반영)
+            for sid in running_ids:
+                st = session.get(Strategy, sid)
+                if st:
+                    st.status = "running"
+                    session.commit()
+                    self._launch_process(st)
 
     def _monitor_crashes(self) -> None:
         with self._lock, Session(self.engine) as session:
