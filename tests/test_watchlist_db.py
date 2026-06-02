@@ -31,3 +31,18 @@ def test_replace_overwrites_previous(db_engine):
         replace_watchlist(session, ["AMD", "INTC"])
         session.commit()
         assert get_watchlist_symbols(session) == ["AMD", "INTC"]
+
+
+def test_strategy_position_size_defaults_to_point_two(db_engine):
+    from decimal import Decimal
+    from db.models import Strategy
+    with Session(db_engine) as session:
+        s = Strategy(
+            name="x", strategy_type="ma_crossover",
+            alpaca_key="k", alpaca_secret="s",
+            budget=Decimal("10000"), status="stopped", run_interval="1m",
+        )
+        session.add(s)
+        session.commit()
+        session.refresh(s)
+        assert float(s.position_size) == 0.2

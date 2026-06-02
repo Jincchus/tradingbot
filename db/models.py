@@ -17,6 +17,7 @@ class Strategy(Base):
     budget: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="stopped")
     run_interval: Mapped[str] = mapped_column(String(20), nullable=False)
+    position_size: Mapped[Decimal] = mapped_column(Numeric(4, 3), nullable=False, default=Decimal("0.2"))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     trades: Mapped[list["Trade"]] = relationship(back_populates="strategy")
