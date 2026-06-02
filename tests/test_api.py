@@ -1,5 +1,7 @@
 import os
 os.environ.setdefault("BOT_API_TOKEN", "")  # disable token auth in tests
+os.environ.setdefault("ALPACA_KEY", "test")
+os.environ.setdefault("ALPACA_SECRET", "test")
 
 import pytest
 from unittest.mock import MagicMock, patch
@@ -121,3 +123,40 @@ def test_get_positions_returns_list(client, seeded_db):
 def test_get_positions_strategy_not_found(client, seeded_db):
     resp = client.get("/strategies/999/positions")
     assert resp.status_code == 404
+
+
+def test_get_watchlist_returns_default_when_empty(client, seeded_db):
+    resp = client.get("/watchlist")
+    assert resp.status_code == 200
+    assert resp.json()["symbols"] == ["AAPL", "MSFT", "NVDA", "TSLA", "GOOGL"]
+
+
+def test_put_watchlist_validates_and_applies(client, seeded_db, mock_mgr):
+    with patch("api.main.TradingClient") as mock_cls:
+        asset = MagicMock()
+        asset.tradable = True
+        asset.status.value = "active"
+        mock_cls.return_value.get_asset.return_value = asset
+        resp = client.put("/watchlist", json={"symbols": ["tsla", "amd"]})
+
+    assert resp.status_code == 200
+    assert resp.json()["symbols"] == ["TSLA", "AMD"]
+    mock_mgr.apply_watchlist.assert_called_once_with(["TSLA", "AMD"])
+
+
+def test_put_watchlist_rejects_invalid_symbol(client, seeded_db, mock_mgr):
+    with patch("api.main.TradingClient") as mock_cls:
+        asset = MagicMock()
+        asset.tradable = False
+        asset.status.value = "inactive"
+        mock_cls.return_value.get_asset.return_value = asset
+        resp = client.put("/watchlist", json={"symbols": ["BADX"]})
+
+    assert resp.status_code == 400
+    mock_mgr.apply_watchlist.assert_not_called()
+
+
+def test_put_watchlist_rejects_empty(client, seeded_db, mock_mgr):
+    resp = client.put("/watchlist", json={"symbols": []})
+    assert resp.status_code == 400
+    mock_mgr.apply_watchlist.assert_not_called()

@@ -12,7 +12,9 @@ from db.database import create_engine_for_process
 from db.models import Strategy, Trade, PortfolioHistory, DailyPerformance
 from api.schemas import (StrategyResponse, TradeResponse,
                          PortfolioHistoryResponse, DailyPerformanceResponse,
-                         PositionResponse)
+                         PositionResponse, WatchlistResponse, WatchlistUpdate,
+                         StrategyUpdate)
+from db.watchlist import get_watchlist_symbols
 from manager.manager import StrategyManager
 
 # Token authentication
@@ -143,3 +145,40 @@ def stop_strategy(id: int, engine: Engine = Depends(get_engine),
             raise HTTPException(status_code=404, detail="Strategy not found")
     mgr.stop_strategy(id)
     return {"message": "stopped"}
+
+
+def validate_symbols(symbols: list[str]) -> list[str]:
+    """거래 불가/존재하지 않는 종목 목록을 돌려준다(빈 리스트=모두 정상)."""
+    key = os.getenv("ALPACA_KEY", "")
+    secret = os.getenv("ALPACA_SECRET", "")
+    if not key or not secret:
+        raise HTTPException(status_code=503, detail="ALPACA_KEY not configured for validation")
+    client = TradingClient(key, secret, paper=True)
+    invalid: list[str] = []
+    for sym in symbols:
+        try:
+            asset = client.get_asset(sym)
+            if not (asset.tradable and asset.status.value == "active"):
+                invalid.append(sym)
+        except Exception:
+            invalid.append(sym)
+    return invalid
+
+
+@app.get("/watchlist", response_model=WatchlistResponse, dependencies=[Depends(require_token)])
+def get_watchlist(engine: Engine = Depends(get_engine)):
+    with Session(engine) as session:
+        return WatchlistResponse(symbols=get_watchlist_symbols(session))
+
+
+@app.put("/watchlist", response_model=WatchlistResponse, dependencies=[Depends(require_token)])
+def update_watchlist(body: WatchlistUpdate,
+                     mgr: StrategyManager = Depends(get_manager)):
+    symbols = [s.strip().upper() for s in body.symbols if s.strip()]
+    if not symbols:
+        raise HTTPException(status_code=400, detail="watchlist must contain at least one symbol")
+    invalid = validate_symbols(symbols)
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"invalid or non-tradable symbols: {invalid}")
+    mgr.apply_watchlist(symbols)
+    return WatchlistResponse(symbols=symbols)
